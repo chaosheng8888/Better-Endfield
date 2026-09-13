@@ -1,4 +1,4 @@
-// BetterEndfield Scene Exporter — v0.7.2 (S4-2: Mesh.MeshDataArray read-only direct channel
+// BetterEndfield Scene Exporter — v0.7.3 (S4-2: Mesh.MeshDataArray read-only direct channel
 // CopyAttributeIntoPtr with checkReadWrite=false to bypass isReadable=false GPU-resident meshes;
 // keep per-part BakeMesh as cross-check; hotkey Ctrl+E).
 //
@@ -95,11 +95,13 @@ MethodContract g_contracts[]{
         {"UnityEngine.CoreModule.dll", "UnityEngine", "Renderer",
             "get_isVisible", nullptr, "System.Boolean", 0}},
     // v0.7.0 MeshData 只读直读通道（绕开 isReadable=false）。嵌套类用“外层.内层”点号写法。
-    // MeshDataArray..ctor(Mesh mesh, bool checkReadWrite)：checkReadWrite=false 跳过可读标志检查。
     // ★多参数类型串必须用竖线 | 分隔（host 的 SplitParameters 只认 |；写逗号会被整段当成一个参数而匹配失败）。
-    {"mda.ctor",
-        {"UnityEngine.CoreModule.dll", "UnityEngine", "Mesh.MeshDataArray",
-            ".ctor", "UnityEngine.Mesh|System.Boolean", "System.Void", 2}},
+    // Mesh.AcquireReadOnlyMeshData(Mesh) 公共静态入口：内部真正向原生锁定只读顶点、返回已填充的 MeshDataArray。
+    // 私有 MeshDataArray..ctor(Mesh,bool) 实测只做空初始化(调完 len=0/ptrs=null)，弃用。
+    // 返回类型故意留 nullptr 不校验（嵌套值类型名可能带 +/.），靠方法名+1个Mesh参数唯一匹配。
+    {"mesh.acquire_ro",
+        {"UnityEngine.CoreModule.dll", "UnityEngine", "Mesh",
+            "AcquireReadOnlyMeshData", "UnityEngine.Mesh", nullptr, 1}},
     // MeshDataArray.Dispose()：读完必须释放对原生顶点缓冲的锁定。
     {"mda.dispose",
         {"UnityEngine.CoreModule.dll", "UnityEngine", "Mesh.MeshDataArray",
@@ -493,7 +495,7 @@ void ExportVertexProbe() {
     MethodContract* m_readable = Contract("mesh.is_readable");
     MethodContract* bake = Contract("skinned.bake_mesh");
     MethodContract* get_visible = Contract("renderer.is_visible");
-    MethodContract* mda_ctor = Contract("mda.ctor");
+    MethodContract* mesh_acquire_ro = Contract("mesh.acquire_ro");
     MethodContract* mda_dispose = Contract("mda.dispose");
     MethodContract* md_vcount = Contract("md.vcount");
     MethodContract* md_copy = Contract("md.copy_pos");
@@ -568,7 +570,7 @@ void ExportVertexProbe() {
             slen = ArrayLengthOf(get_length, Invoke(get_verts, shared, nullptr));
         }
 
-        // v0.7.2 MeshData 只读直读 + 逐步诊断日志（定位运行时断点）。
+        // v0.7.3 MeshData 只读直读 + 逐步诊断日志（定位运行时断点）。
         int32_t mdvc = -1;
         bool mdok = false;
         auto mdlog = [&](const char* stage) {
@@ -576,26 +578,25 @@ void ExportVertexProbe() {
             std::snprintf(dbg, sizeof(dbg), "md-stage[%s] %s", parts[pi].name.c_str(), stage);
             Log(dbg);
         };
-        if (!(shared && g_mda_class_info && mda_ctor->resolved && mda_dispose->resolved &&
+        if (!(shared && mesh_acquire_ro->resolved && mda_dispose->resolved &&
               md_vcount->resolved && md_copy->resolved)) {
-            mdlog("guard-fail contract/class/shared null");
+            mdlog("guard-fail contract/shared null");
         } else {
-            void* boxed_mda = g_host->object_new(g_host->context, g_mda_class_info);
-            if (!boxed_mda) { mdlog("new-boxed=null"); }
+            // 公共静态入口：Mesh 是引用类型，参数直接放对象指针本身(不是取地址)；返回装箱的 MeshDataArray。
+            bool af = false;
+            void* ap[1]{ shared };
+            void* boxed_mda = SafeRuntimeInvoke(mesh_acquire_ro->method_info, nullptr, ap, nullptr, &af);
+            if (af || !boxed_mda) { mdlog("acquire invoke-fail/null"); }
             else {
-                bool check_rw = false, cf = false;
-                void* cp[2]{ shared, &check_rw };
-                SafeRuntimeInvoke(mda_ctor->method_info, boxed_mda, cp, nullptr, &cf);
                 // unbox 后字段起点：m_Ptrs@0(IntPtr*)、m_Length@8(int)（dump 标注 0x10/0x18 已含对象头）。
                 struct MDA { void** ptrs; int32_t len; };
                 MDA mda{ nullptr, 0 };
                 bool uf = false;
-                bool unboxed = (!cf) && SafeUnbox(boxed_mda, &mda, sizeof(mda), &uf);
-                if (cf) { mdlog("ctor threw csharp-exception"); }
-                else if (!unboxed || uf) { mdlog("unbox-fail"); }
+                bool unboxed = SafeUnbox(boxed_mda, &mda, sizeof(mda), &uf);
+                if (!unboxed || uf) { mdlog("unbox-fail"); }
                 else {
                     char ib[200];
-                    std::snprintf(ib, sizeof(ib), "unbox-ok len=%d ptrs=%p p0=%p", mda.len,
+                    std::snprintf(ib, sizeof(ib), "acquire-ok len=%d ptrs=%p p0=%p", mda.len,
                         static_cast<void*>(mda.ptrs),
                         mda.ptrs ? static_cast<void*>(mda.ptrs[0]) : nullptr);
                     mdlog(ib);
@@ -728,7 +729,7 @@ void ExportVertexProbe() {
         Log("vertex-probe: open output file fail.");
         return;
     }
-    fwprintf(file, L"Chen vertex probe v0.7.2 (MeshData direct + BakeMesh cross-check)\nparts: %d\n",
+    fwprintf(file, L"Chen vertex probe v0.7.3 (MeshData direct + BakeMesh cross-check)\nparts: %d\n",
         static_cast<int>(rows.size()));
     fwprintf(file, L"%-40ls %7s %7s %8s %7s %6s %9s %7s\n", L"part", L"shr_vc", L"shr_len", L"bake_len", L"md_vc", L"md_ok", L"readabl", L"visible");
     for (auto& rw : rows) {
@@ -892,7 +893,7 @@ BE_Result BE_CALL Initialize(const BE_HostApiV1* host) {
 
     g_input_stop.store(false, std::memory_order_release);
     g_input_thread = std::thread(InputThreadMain);
-    Log("Scene Exporter v0.7.2 ready (Cameras + SkinnedMesh + MeshData direct vertex channel + step diagnostics). Focus the game and press Ctrl+E.");
+    Log("Scene Exporter v0.7.3 ready (Cameras + SkinnedMesh + MeshData direct vertex channel + step diagnostics). Focus the game and press Ctrl+E.");
     return BE_Result_Ok;
 }
 
@@ -922,7 +923,7 @@ void BE_CALL Shutdown() {
 }
 
 const BE_ModuleApiV1 kApi{
-    {kModuleId, "Scene Exporter", "0.7.2", BETTER_ENDFIELD_MODULE_ABI_V1},
+    {kModuleId, "Scene Exporter", "0.7.3", BETTER_ENDFIELD_MODULE_ABI_V1},
     &Initialize, &ConfigurationChanged, &Shutdown};
 
 } // namespace
