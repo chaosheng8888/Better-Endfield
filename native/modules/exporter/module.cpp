@@ -1,4 +1,4 @@
-// BetterEndfield Scene Exporter — v0.3.0 (S3 cameras + S4 layer1 SkinnedMeshRenderer.sharedMesh/vertexCount; hotkey Ctrl+Shift+E).
+// BetterEndfield Scene Exporter — v0.4.0 (S3 cameras + S4-1 SkinnedMeshRenderer/vertexCount + S4-2 Chen Vector3[] vertex probe; hotkey Ctrl+Shift+E).
 //
 // S3 目标（只验证链路，不导网格）：游戏内按组合热键(Ctrl+Shift+E)，在 Unity 主线程枚举
 // “当前已加载场景”里指定类型的全部对象，把数量和名字写到本地 txt。
@@ -71,6 +71,10 @@ MethodContract g_contracts[]{
     {"mesh.get_vertex_count",
         {"UnityEngine.CoreModule.dll", "UnityEngine", "Mesh",
             "get_vertexCount", nullptr, "System.Int32", 0}},
+    // S4-2 实例属性 getter：Mesh.get_vertices() -> UnityEngine.Vector3[]（无参，值类型结构体数组）。
+    {"mesh.get_vertices",
+        {"UnityEngine.CoreModule.dll", "UnityEngine", "Mesh",
+            "get_vertices", nullptr, "UnityEngine.Vector3[]", 0}},
 };
 
 using PumpFn = void(__fastcall*)(void* instance, void* method);
@@ -412,11 +416,172 @@ void ExportSkinnedMeshes() {
     Log(done);
 }
 
-// 热键总入口（只在主线程）：先导相机（哨兵，证明基础管道活着），再导蒙皮网格（S4 第一层）。
-// 两段相互独立；所有 IL2CPP 调用内部已有 SEH 兜底，这里不再包 __try（本函数无 C++ 析构对象也保持简单）。
+// 热键总入口（只在主线程）：先导相机（哨兵，证明基础管道活着），再导蒙皮网格（S4 第一层），
+// 最后做陈千语顶点坐标探针（S4 第二层最小验证）。所有 IL2CPP 调用内部已有 SEH 兜底。
+// ===========================================================================
+// S4-2：UnityEngine.Vector3 = 3 个紧排 float（x/y/z，unbox 后即字段起点，共 12 字节）。
+// ===========================================================================
+struct BE_Vec3 { float x, y, z; };
+
+// 顶点坐标探针：枚举蒙皮网格，挑第一个名字匹配 S_actor_chen_*_lod0 的部件，
+// 取 sharedMesh → vertexCount 与 get_vertices(Vector3[]) 长度比对，逐元素 GetValue→unbox
+// 读出 xyz，算包围盒、抽样坐标写文件。只验证“值类型结构体数组能被完整正确读出”，故只取一个部件。
+void ExportVertexProbe() {
+    MethodContract* find_all = Contract("object.find_all_of_type");
+    MethodContract* get_name = Contract("object.get_name");
+    MethodContract* get_length = Contract("array.get_length");
+    MethodContract* get_value = Contract("array.get_value");
+    MethodContract* get_mesh = Contract("skinned.get_shared_mesh");
+    MethodContract* get_vcount = Contract("mesh.get_vertex_count");
+    MethodContract* get_verts = Contract("mesh.get_vertices");
+    if (!g_skinned_type || !find_all->resolved || !get_name->resolved ||
+        !get_length->resolved || !get_value->resolved || !get_mesh->resolved ||
+        !get_vcount->resolved || !get_verts->resolved) {
+        Log("vertex-probe skipped: contracts/type not ready.");
+        return;
+    }
+    static const char* kPrefix = "S_actor_chen_";
+    static const char* kLodTag = "_lod0";
+    const size_t kPrefixLen = std::strlen(kPrefix);
+    const int32_t kProbeCap = 80000; // 单部件读取上限，第一次验证不追求全量
+
+    const DWORD t0 = GetTickCount();
+    Log("vertex-probe: enumerating SkinnedMeshRenderer, looking for first Chen lod0 part ...");
+    void* find_params[1]{ g_skinned_type };
+    void* objs = Invoke(find_all, nullptr, find_params);
+    if (!objs) { Log("vertex-probe: enumerate failed."); return; }
+
+    int32_t dimension = 0;
+    void* len_params[1]{&dimension};
+    int32_t total = 0;
+    bool lf = false;
+    if (!SafeUnbox(Invoke(get_length, objs, len_params), &total, sizeof(total), &lf)) {
+        Log("vertex-probe: array length failed.");
+        return;
+    }
+
+    void* chosen = nullptr;
+    std::string chosen_name;
+    for (int32_t i = 0; i < total && !chosen; ++i) {
+        int32_t idx = i;
+        void* ip[1]{&idx};
+        void* r = Invoke(get_value, objs, ip);
+        if (!r) continue;
+        char nb[256]{};
+        bool nf = false;
+        void* no = Invoke(get_name, r, nullptr);
+        if (!nf && SafeCopyName(no, nb, sizeof(nb), &nf) > 0) {
+            const bool match = std::strncmp(nb, kPrefix, kPrefixLen) == 0 &&
+                               std::strstr(nb, kLodTag) != nullptr;
+            if (match) { chosen = r; chosen_name = nb; }
+        }
+    }
+    if (!chosen) {
+        Log("vertex-probe: no S_actor_chen_*_lod0 part in current loaded scene.");
+        return;
+    }
+    {
+        char m[200];
+        std::snprintf(m, sizeof(m), "vertex-probe: picked part = %s", chosen_name.c_str());
+        Log(m);
+    }
+
+    void* mesh = Invoke(get_mesh, chosen, nullptr);
+    if (!mesh) { Log("vertex-probe: sharedMesh null."); return; }
+    int32_t vc = 0;
+    bool vf = false;
+    if (!SafeUnbox(Invoke(get_vcount, mesh, nullptr), &vc, sizeof(vc), &vf)) {
+        Log("vertex-probe: vertexCount failed.");
+        return;
+    }
+
+    void* varr = Invoke(get_verts, mesh, nullptr); // UnityEngine.Vector3[]
+    if (!varr) { Log("vertex-probe: get_vertices returned null."); return; }
+    int32_t vlen = 0;
+    bool af = false;
+    if (!SafeUnbox(Invoke(get_length, varr, len_params), &vlen, sizeof(vlen), &af)) {
+        Log("vertex-probe: vertices length failed.");
+        return;
+    }
+    {
+        char lm[200];
+        std::snprintf(lm, sizeof(lm),
+            "vertex-probe: vertexCount=%d  vertices.Length=%d  %s",
+            static_cast<int>(vc), static_cast<int>(vlen),
+            vc == vlen ? "MATCH" : "MISMATCH");
+        Log(lm);
+    }
+
+    const int32_t n = vlen < kProbeCap ? vlen : kProbeCap;
+    std::vector<BE_Vec3> pts;
+    pts.reserve(static_cast<size_t>(n));
+    BE_Vec3 mn{0, 0, 0}, mx{0, 0, 0};
+    bool have = false;
+    int failcnt = 0;
+    for (int32_t i = 0; i < n; ++i) {
+        int32_t idx = i;
+        void* ip[1]{&idx};
+        void* boxed = Invoke(get_value, varr, ip);
+        BE_Vec3 p{0, 0, 0};
+        bool pf = false;
+        if (!boxed || !SafeUnbox(boxed, &p, sizeof(BE_Vec3), &pf)) { ++failcnt; continue; }
+        if (!have) { mn = mx = p; have = true; }
+        else {
+            if (p.x < mn.x) mn.x = p.x; if (p.y < mn.y) mn.y = p.y; if (p.z < mn.z) mn.z = p.z;
+            if (p.x > mx.x) mx.x = p.x; if (p.y > mx.y) mx.y = p.y; if (p.z > mx.z) mx.z = p.z;
+        }
+        pts.push_back(p);
+    }
+    const DWORD ms = GetTickCount() - t0;
+    {
+        char fm[256];
+        std::snprintf(fm, sizeof(fm),
+            "vertex-probe: read %d verts (%d failed), AABB min(%.4f,%.4f,%.4f) max(%.4f,%.4f,%.4f), %lu ms",
+            static_cast<int>(pts.size()), failcnt, mn.x, mn.y, mn.z, mx.x, mx.y, mx.z,
+            static_cast<unsigned long>(ms));
+        Log(fm);
+    }
+
+    wchar_t local_app_data[MAX_PATH];
+    const DWORD got = GetEnvironmentVariableW(L"LOCALAPPDATA", local_app_data, MAX_PATH);
+    if (got == 0 || got >= MAX_PATH) return;
+    const std::wstring be_root = std::wstring(local_app_data) + L"\\BetterEndfield";
+    const std::wstring dir = be_root + L"\\scene-export";
+    CreateDirectoryW(be_root.c_str(), nullptr);
+    CreateDirectoryW(dir.c_str(), nullptr);
+    wchar_t path[MAX_PATH * 2];
+    swprintf_s(path, _countof(path), L"%ls\\chen_vertex_probe_%llu.txt", dir.c_str(),
+        static_cast<unsigned long long>(GetTickCount64()));
+    FILE* file = nullptr;
+    if (_wfopen_s(&file, path, L"w, ccs=UTF-8") != 0 || !file) {
+        Log("vertex-probe: cannot open output file.");
+        return;
+    }
+    const std::wstring wn = Utf8ToWide(chosen_name);
+    fwprintf(file, L"Chen vertex probe (S4-2)\npart: %ls\nvertexCount: %d\nvertices.Length: %d\nlength match: %ls\n",
+        wn.c_str(), static_cast<int>(vc), static_cast<int>(vlen),
+        vc == vlen ? L"YES" : L"NO");
+    fwprintf(file, L"processed: %d (cap %d), failed elements: %d, time ms: %lu\n",
+        static_cast<int>(pts.size()), static_cast<int>(n), failcnt,
+        static_cast<unsigned long>(ms));
+    fwprintf(file, L"AABB min: %.5f %.5f %.5f\nAABB max: %.5f %.5f %.5f\nsize: %.5f %.5f %.5f\n",
+        mn.x, mn.y, mn.z, mx.x, mx.y, mx.z, mx.x - mn.x, mx.y - mn.y, mx.z - mn.z);
+    fwprintf(file, L"--- first 5 vertices ---\n");
+    for (int i = 0; i < 5 && i < static_cast<int>(pts.size()); ++i)
+        fwprintf(file, L"[%d] %.5f %.5f %.5f\n", i, pts[i].x, pts[i].y, pts[i].z);
+    fwprintf(file, L"--- last 5 vertices ---\n");
+    int last_start = static_cast<int>(pts.size()) - 5;
+    if (last_start < 5) last_start = 5;
+    for (int i = last_start; i < static_cast<int>(pts.size()); ++i)
+        fwprintf(file, L"[%d] %.5f %.5f %.5f\n", i, pts[i].x, pts[i].y, pts[i].z);
+    fclose(file);
+    Log("vertex-probe FINISHED: chen_vertex_probe_*.txt written.");
+}
+
 void RunExportOnMainThread() {
     ExportCameras();
     ExportSkinnedMeshes();
+    ExportVertexProbe();
 }
 
 bool IsKeyDown(int virtual_key) {
@@ -474,7 +639,8 @@ bool ResolveContracts() {
                        Contract("array.get_length")->resolved &&
                        Contract("array.get_value")->resolved &&
                        Contract("skinned.get_shared_mesh")->resolved &&
-                       Contract("mesh.get_vertex_count")->resolved;
+                       Contract("mesh.get_vertex_count")->resolved &&
+                       Contract("mesh.get_vertices")->resolved;
     g_contracts_ready.store(ready, std::memory_order_release);
     return ready;
 }
@@ -528,7 +694,7 @@ BE_Result BE_CALL Initialize(const BE_HostApiV1* host) {
 
     g_input_stop.store(false, std::memory_order_release);
     g_input_thread = std::thread(InputThreadMain);
-    Log("Scene Exporter v0.3.0 ready (Cameras + SkinnedMesh vertexCount). Focus the game and press Ctrl+Shift+E.");
+    Log("Scene Exporter v0.4.0 ready (Cameras + SkinnedMesh + Chen vertex probe). Focus the game and press Ctrl+Shift+E.");
     return BE_Result_Ok;
 }
 
@@ -558,7 +724,7 @@ void BE_CALL Shutdown() {
 }
 
 const BE_ModuleApiV1 kApi{
-    {kModuleId, "Scene Exporter", "0.3.0", BETTER_ENDFIELD_MODULE_ABI_V1},
+    {kModuleId, "Scene Exporter", "0.4.0", BETTER_ENDFIELD_MODULE_ABI_V1},
     &Initialize, &ConfigurationChanged, &Shutdown};
 
 } // namespace
