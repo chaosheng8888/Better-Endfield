@@ -1,4 +1,4 @@
-// BetterEndfield Scene Exporter — S3 minimal link test (v0.2.0).
+// BetterEndfield Scene Exporter — S3 minimal link test (v0.2.1: fix reference-type Type arg passing).
 //
 // S3 目标（只验证链路，不导网格）：游戏内按热键(F9)，在 Unity 主线程枚举
 // “当前已加载场景”里指定类型的全部对象，把数量和名字写到本地 txt。
@@ -190,8 +190,11 @@ void RunExportOnMainThread() {
 
     // 第 1 步：静态枚举当前场景全部 Camera（S3 最小、最轻）。
     Log("export step 1/4: FindObjectsOfType(Camera) ...");
-    void* type_arg = g_target_type;
-    void* find_params[1]{&type_arg};
+    // IL2CPP 调用约定：引用类型参数(如 System.Type 这种类对象)在参数槽里【直接放托管对象指针】；
+    // 只有 int/bool/struct 等值类型才传“指向值的指针(&)”。作者 model 模块 GetComponentsInChildren
+    // 就是 parameters[]{type_object, &bool} 这样写且已跑通。之前多包一层 &type_arg 会让运行时
+    // 把栈地址当成对象解引用而 native fault。
+    void* find_params[1]{ g_target_type };
     void* objects = Invoke(find_all, nullptr /* 静态方法无 this */, find_params);
     if (!objects) {
         Log("step 1 failed or returned nothing (FindObjectsOfType).");
@@ -372,7 +375,7 @@ BE_Result BE_CALL Initialize(const BE_HostApiV1* host) {
 
     g_input_stop.store(false, std::memory_order_release);
     g_input_thread = std::thread(InputThreadMain);
-    Log("Scene Exporter ready (S3 minimal=Camera). Focus the game and press F9.");
+    Log("Scene Exporter v0.2.1 ready (S3 minimal=Camera, ref-type arg fixed). Focus the game and press F9.");
     return BE_Result_Ok;
 }
 
@@ -397,7 +400,7 @@ void BE_CALL Shutdown() {
 }
 
 const BE_ModuleApiV1 kApi{
-    {kModuleId, "Scene Exporter", "0.2.0", BETTER_ENDFIELD_MODULE_ABI_V1},
+    {kModuleId, "Scene Exporter", "0.2.1", BETTER_ENDFIELD_MODULE_ABI_V1},
     &Initialize, &ConfigurationChanged, &Shutdown};
 
 } // namespace
