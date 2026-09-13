@@ -1,9 +1,12 @@
 name: Build Scene Exporter
 
-# Cloud build: triggered on changes under native/ or this workflow file; can also be run manually.
-# Pinned to windows-2022 because it ships Visual Studio 2022 (MSVC v143 C++), Windows SDK and CMake.
-# windows-latest was upgraded and no longer provides VS2022 ("could not find any instance of Visual Studio").
-# Only build the Exporter target to skip UI/dotnet/voice manifest prerequisites and get the dll fast.
+# Cloud build for the minimal injectable set needed to test our own Exporter
+# inside the running game. Pinned to windows-2022 (ships VS2022 MSVC v143).
+# Layout produced by CMake stage dir:
+#   runtime/BetterEndfield.Host.dll
+#   loaders/BetterEndfield.Bootstrap.dll , BetterEndfield.Injector.exe
+#   modules/BetterEndfield.Exporter.dll , betterendfield.exporter.module.ini
+# Injector usage: BetterEndfield.Injector.exe --game <full path to Endfield.exe>
 on:
   push:
     paths:
@@ -18,28 +21,36 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Show toolchain (cmake version + installed Visual Studio)
+      - name: Show toolchain
         shell: pwsh
-        run: |
-          cmake --version
-          $vswhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
-          if (Test-Path $vswhere) { & $vswhere -all -products * } else { Write-Warning "vswhere not found" }
+        run: cmake --version
 
       - name: Configure (Visual Studio 2022, x64)
         run: cmake -S native -B build -G "Visual Studio 17 2022" -A x64
 
-      - name: Build Exporter target (Release)
-        run: cmake --build build --config Release --target BetterEndfield.Exporter --parallel
+      - name: Build minimal injectable set (Host, Bootstrap, Injector, Exporter)
+        run: cmake --build build --config Release --target BetterEndfield.Host BetterEndfield.Bootstrap BetterEndfield.Injector BetterEndfield.Exporter --parallel
 
-      - name: Stage module manifest next to the dll
+      - name: Stage module manifest next to the Exporter dll
         shell: pwsh
         run: Copy-Item native/modules/exporter/betterendfield.exporter.module.ini build/stage/Release/modules/ -Force
 
-      - name: Upload Exporter artifact
+      - name: Verify staged layout
+        shell: pwsh
+        run: |
+          Get-ChildItem build/stage/Release -Recurse -File | ForEach-Object { $_.FullName }
+          $need = @(
+            'build/stage/Release/runtime/BetterEndfield.Host.dll',
+            'build/stage/Release/loaders/BetterEndfield.Bootstrap.dll',
+            'build/stage/Release/loaders/BetterEndfield.Injector.exe',
+            'build/stage/Release/modules/BetterEndfield.Exporter.dll',
+            'build/stage/Release/modules/betterendfield.exporter.module.ini'
+          )
+          foreach ($f in $need) { if (-not (Test-Path $f)) { throw "Missing staged file: $f" } }
+
+      - name: Upload minimal injectable artifact
         uses: actions/upload-artifact@v4
         with:
-          name: BetterEndfield.Exporter-win-x64
+          name: BetterEndfield.MinimalInject-win-x64
           if-no-files-found: error
-          path: |
-            build/stage/Release/modules/BetterEndfield.Exporter.dll
-            build/stage/Release/modules/betterendfield.exporter.module.ini
+          path: build/stage/Release
