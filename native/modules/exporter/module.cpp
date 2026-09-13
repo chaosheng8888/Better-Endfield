@@ -1,4 +1,4 @@
-// BetterEndfield Scene Exporter — v0.4.0 (S3 cameras + S4-1 SkinnedMeshRenderer/vertexCount + S4-2 Chen Vector3[] vertex probe; hotkey Ctrl+Shift+E).
+// BetterEndfield Scene Exporter — v0.5.0 (S4-2 fix: BakeMesh readable probe across all Chen lod0 parts, diagnose sharedMesh.isReadable; hotkey Ctrl+Shift+E).
 //
 // S3 目标（只验证链路，不导网格）：游戏内按组合热键(Ctrl+Shift+E)，在 Unity 主线程枚举
 // “当前已加载场景”里指定类型的全部对象，把数量和名字写到本地 txt。
@@ -75,6 +75,18 @@ MethodContract g_contracts[]{
     {"mesh.get_vertices",
         {"UnityEngine.CoreModule.dll", "UnityEngine", "Mesh",
             "get_vertices", nullptr, "UnityEngine.Vector3[]", 0}},
+    // S4-2 修复：Mesh 构造函数（object_new 分配后必须调 .ctor 原生初始化才能用）。
+    {"mesh.ctor",
+        {"UnityEngine.CoreModule.dll", "UnityEngine", "Mesh",
+            ".ctor", nullptr, "System.Void", 0}},
+    // S4-2 诊断：Mesh.isReadable（运行时网格常为 false，导致 .vertices 返回空数组）。
+    {"mesh.is_readable",
+        {"UnityEngine.CoreModule.dll", "UnityEngine", "Mesh",
+            "get_isReadable", nullptr, "System.Boolean", 0}},
+    // S4-2 修复：SkinnedMeshRenderer.BakeMesh(Mesh) 把当前蒙皮姿态烘焙进一个可读 Mesh。
+    {"skinned.bake_mesh",
+        {"UnityEngine.CoreModule.dll", "UnityEngine", "SkinnedMeshRenderer",
+            "BakeMesh", "UnityEngine.Mesh", "System.Void", 1}},
 };
 
 using PumpFn = void(__fastcall*)(void* instance, void* method);
@@ -86,6 +98,8 @@ uint32_t g_target_type_root = 0; // GC 保活句柄
 // S4-1 目标：UnityEngine.SkinnedMeshRenderer 的 System.Type 托管对象。
 void* g_skinned_type = nullptr;
 uint32_t g_skinned_type_root = 0;
+// S4-2：UnityEngine.Mesh 的原生类信息（class_info，用于 object_new 新建烘焙网格；元数据不需 GC 保活）。
+void* g_mesh_class_info = nullptr;
 
 std::atomic_bool g_export_request{false};
 std::atomic_int g_hotkey{VK_F9};
@@ -423,9 +437,20 @@ void ExportSkinnedMeshes() {
 // ===========================================================================
 struct BE_Vec3 { float x, y, z; };
 
-// 顶点坐标探针：枚举蒙皮网格，挑第一个名字匹配 S_actor_chen_*_lod0 的部件，
-// 取 sharedMesh → vertexCount 与 get_vertices(Vector3[]) 长度比对，逐元素 GetValue→unbox
-// 读出 xyz，算包围盒、抽样坐标写文件。只验证“值类型结构体数组能被完整正确读出”，故只取一个部件。
+// 读托管一维数组长度，失败返回 -1（dimension 固定 0）。
+int32_t ArrayLengthOf(MethodContract* get_length, void* arr) {
+    if (!arr) return -1;
+    int32_t dimension = 0;
+    void* p[1]{&dimension};
+    int32_t len = 0;
+    bool fault = false;
+    if (!SafeUnbox(Invoke(get_length, arr, p), &len, sizeof(len), &fault)) return -1;
+    return len;
+}
+
+// 顶点坐标探针（v0.5.0）：收集所有 S_actor_chen_*_lod0 部件，逐个对照
+// sharedMesh（直接读；运行时网格常 isReadable=false → .vertices 返回空）与 BakeMesh 烘焙出的可读网格，
+// 写“每部件对照表”，并对第一个烘焙出非空顶点的部件完整读 xyz、算 AABB、抽样坐标验证正确性。
 void ExportVertexProbe() {
     MethodContract* find_all = Contract("object.find_all_of_type");
     MethodContract* get_name = Contract("object.get_name");
@@ -434,35 +459,33 @@ void ExportVertexProbe() {
     MethodContract* get_mesh = Contract("skinned.get_shared_mesh");
     MethodContract* get_vcount = Contract("mesh.get_vertex_count");
     MethodContract* get_verts = Contract("mesh.get_vertices");
-    if (!g_skinned_type || !find_all->resolved || !get_name->resolved ||
-        !get_length->resolved || !get_value->resolved || !get_mesh->resolved ||
-        !get_vcount->resolved || !get_verts->resolved) {
+    MethodContract* m_ctor = Contract("mesh.ctor");
+    MethodContract* m_readable = Contract("mesh.is_readable");
+    MethodContract* bake = Contract("skinned.bake_mesh");
+    if (!g_skinned_type || !g_mesh_class_info ||
+        !find_all->resolved || !get_name->resolved || !get_length->resolved || !get_value->resolved ||
+        !get_mesh->resolved || !get_vcount->resolved || !get_verts->resolved ||
+        !m_ctor->resolved || !m_readable->resolved || !bake->resolved) {
         Log("vertex-probe skipped: contracts/type not ready.");
         return;
     }
     static const char* kPrefix = "S_actor_chen_";
     static const char* kLodTag = "_lod0";
     const size_t kPrefixLen = std::strlen(kPrefix);
-    const int32_t kProbeCap = 80000; // 单部件读取上限，第一次验证不追求全量
+    const int32_t kPartCap = 20;
+    const int32_t kVertCap = 80000;
 
     const DWORD t0 = GetTickCount();
-    Log("vertex-probe: enumerating SkinnedMeshRenderer, looking for first Chen lod0 part ...");
+    Log("vertex-probe: collecting all Chen lod0 parts ...");
     void* find_params[1]{ g_skinned_type };
     void* objs = Invoke(find_all, nullptr, find_params);
     if (!objs) { Log("vertex-probe: enumerate failed."); return; }
+    const int32_t total = ArrayLengthOf(get_length, objs);
+    if (total < 0) { Log("vertex-probe: length failed."); return; }
 
-    int32_t dimension = 0;
-    void* len_params[1]{&dimension};
-    int32_t total = 0;
-    bool lf = false;
-    if (!SafeUnbox(Invoke(get_length, objs, len_params), &total, sizeof(total), &lf)) {
-        Log("vertex-probe: array length failed.");
-        return;
-    }
-
-    void* chosen = nullptr;
-    std::string chosen_name;
-    for (int32_t i = 0; i < total && !chosen; ++i) {
+    struct Part { void* renderer; std::string name; };
+    std::vector<Part> parts;
+    for (int32_t i = 0; i < total && static_cast<int32_t>(parts.size()) < kPartCap; ++i) {
         int32_t idx = i;
         void* ip[1]{&idx};
         void* r = Invoke(get_value, objs, ip);
@@ -471,74 +494,87 @@ void ExportVertexProbe() {
         bool nf = false;
         void* no = Invoke(get_name, r, nullptr);
         if (!nf && SafeCopyName(no, nb, sizeof(nb), &nf) > 0) {
-            const bool match = std::strncmp(nb, kPrefix, kPrefixLen) == 0 &&
-                               std::strstr(nb, kLodTag) != nullptr;
-            if (match) { chosen = r; chosen_name = nb; }
+            if (std::strncmp(nb, kPrefix, kPrefixLen) == 0 && std::strstr(nb, kLodTag))
+                parts.push_back(Part{ r, nb });
         }
     }
-    if (!chosen) {
-        Log("vertex-probe: no S_actor_chen_*_lod0 part in current loaded scene.");
-        return;
-    }
+    if (parts.empty()) { Log("vertex-probe: no S_actor_chen_*_lod0 part loaded."); return; }
     {
-        char m[200];
-        std::snprintf(m, sizeof(m), "vertex-probe: picked part = %s", chosen_name.c_str());
+        char m[128];
+        std::snprintf(m, sizeof(m), "vertex-probe: %d Chen lod0 parts collected.",
+            static_cast<int>(parts.size()));
         Log(m);
     }
 
-    void* mesh = Invoke(get_mesh, chosen, nullptr);
-    if (!mesh) { Log("vertex-probe: sharedMesh null."); return; }
-    int32_t vc = 0;
-    bool vf = false;
-    if (!SafeUnbox(Invoke(get_vcount, mesh, nullptr), &vc, sizeof(vc), &vf)) {
-        Log("vertex-probe: vertexCount failed.");
-        return;
-    }
+    // 新建一个可复用的烘焙目标 Mesh，并调原生构造函数。
+    void* baked = g_host->object_new(g_host->context, g_mesh_class_info);
+    if (!baked) { Log("vertex-probe: object_new(Mesh) failed."); return; }
+    Invoke(m_ctor, baked, nullptr);
+    const uint32_t baked_handle = g_host->gchandle_new(g_host->context, baked, 0);
 
-    void* varr = Invoke(get_verts, mesh, nullptr); // UnityEngine.Vector3[]
-    if (!varr) { Log("vertex-probe: get_vertices returned null."); return; }
-    int32_t vlen = 0;
-    bool af = false;
-    if (!SafeUnbox(Invoke(get_length, varr, len_params), &vlen, sizeof(vlen), &af)) {
-        Log("vertex-probe: vertices length failed.");
-        return;
-    }
-    {
-        char lm[200];
-        std::snprintf(lm, sizeof(lm),
-            "vertex-probe: vertexCount=%d  vertices.Length=%d  %s",
-            static_cast<int>(vc), static_cast<int>(vlen),
-            vc == vlen ? "MATCH" : "MISMATCH");
-        Log(lm);
-    }
+    struct Row { std::string name; int32_t svc, slen, blen; bool readable; };
+    std::vector<Row> rows;
+    bool sampled = false;
+    std::string sample_name;
+    std::vector<BE_Vec3> spts;
+    BE_Vec3 smn{0, 0, 0}, smx{0, 0, 0};
+    int sfail = 0, sbvc = 0;
 
-    const int32_t n = vlen < kProbeCap ? vlen : kProbeCap;
-    std::vector<BE_Vec3> pts;
-    pts.reserve(static_cast<size_t>(n));
-    BE_Vec3 mn{0, 0, 0}, mx{0, 0, 0};
-    bool have = false;
-    int failcnt = 0;
-    for (int32_t i = 0; i < n; ++i) {
-        int32_t idx = i;
-        void* ip[1]{&idx};
-        void* boxed = Invoke(get_value, varr, ip);
-        BE_Vec3 p{0, 0, 0};
-        bool pf = false;
-        if (!boxed || !SafeUnbox(boxed, &p, sizeof(BE_Vec3), &pf)) { ++failcnt; continue; }
-        if (!have) { mn = mx = p; have = true; }
-        else {
-            if (p.x < mn.x) mn.x = p.x; if (p.y < mn.y) mn.y = p.y; if (p.z < mn.z) mn.z = p.z;
-            if (p.x > mx.x) mx.x = p.x; if (p.y > mx.y) mx.y = p.y; if (p.z > mx.z) mx.z = p.z;
+    for (size_t pi = 0; pi < parts.size(); ++pi) {
+        void* r = parts[pi].renderer;
+        void* shared = Invoke(get_mesh, r, nullptr);
+        int32_t svc = -1, slen = -1;
+        bool readable = false;
+        if (shared) {
+            bool vf = false; int32_t vc = 0;
+            if (SafeUnbox(Invoke(get_vcount, shared, nullptr), &vc, sizeof(vc), &vf)) svc = vc;
+            bool rf = false, rd = false;
+            if (SafeUnbox(Invoke(m_readable, shared, nullptr), &rd, sizeof(rd), &rf)) readable = rd;
+            slen = ArrayLengthOf(get_length, Invoke(get_verts, shared, nullptr));
         }
-        pts.push_back(p);
+        // 把当前蒙皮姿态烘焙进 baked（每次覆盖）。
+        void* bake_params[1]{ baked };
+        Invoke(bake, r, bake_params);
+        int32_t blen = ArrayLengthOf(get_length, Invoke(get_verts, baked, nullptr));
+        int32_t bvc = -1;
+        { bool f = false; int32_t v = 0;
+          if (SafeUnbox(Invoke(get_vcount, baked, nullptr), &v, sizeof(v), &f)) bvc = v; }
+        rows.push_back(Row{ parts[pi].name, svc, slen, blen, readable });
+
+        if (!sampled && blen > 0) {
+            sampled = true;
+            sample_name = parts[pi].name;
+            sbvc = bvc;
+            void* barr = Invoke(get_verts, baked, nullptr);
+            const int32_t n = blen < kVertCap ? blen : kVertCap;
+            spts.reserve(n);
+            for (int32_t i = 0; i < n; ++i) {
+                int32_t idx = i;
+                void* vp[1]{&idx};
+                BE_Vec3 p{0, 0, 0};
+                bool pf = false;
+                void* box = Invoke(get_value, barr, vp);
+                if (!box || !SafeUnbox(box, &p, sizeof(BE_Vec3), &pf)) { ++sfail; continue; }
+                if (spts.empty()) { smn = smx = p; }
+                else {
+                    if (p.x < smn.x) smn.x = p.x; if (p.y < smn.y) smn.y = p.y; if (p.z < smn.z) smn.z = p.z;
+                    if (p.x > smx.x) smx.x = p.x; if (p.y > smx.y) smx.y = p.y; if (p.z > smx.z) smx.z = p.z;
+                }
+                spts.push_back(p);
+            }
+        }
     }
-    const DWORD ms = GetTickCount() - t0;
+    if (baked_handle) g_host->gchandle_free(g_host->context, baked_handle);
+
+    int shared_nonempty = 0, baked_nonempty = 0;
+    for (auto& rw : rows) { if (rw.slen > 0) ++shared_nonempty; if (rw.blen > 0) ++baked_nonempty; }
     {
-        char fm[256];
+        char fm[300];
         std::snprintf(fm, sizeof(fm),
-            "vertex-probe: read %d verts (%d failed), AABB min(%.4f,%.4f,%.4f) max(%.4f,%.4f,%.4f), %lu ms",
-            static_cast<int>(pts.size()), failcnt, mn.x, mn.y, mn.z, mx.x, mx.y, mx.z,
-            static_cast<unsigned long>(ms));
+            "vertex-probe: parts=%d sharedNonEmpty=%d bakedNonEmpty=%d sample='%s' verts=%d fail=%d %lu ms",
+            static_cast<int>(rows.size()), shared_nonempty, baked_nonempty,
+            sample_name.c_str(), static_cast<int>(spts.size()), sfail,
+            static_cast<unsigned long>(GetTickCount() - t0));
         Log(fm);
     }
 
@@ -554,26 +590,30 @@ void ExportVertexProbe() {
         static_cast<unsigned long long>(GetTickCount64()));
     FILE* file = nullptr;
     if (_wfopen_s(&file, path, L"w, ccs=UTF-8") != 0 || !file) {
-        Log("vertex-probe: cannot open output file.");
+        Log("vertex-probe: open output file fail.");
         return;
     }
-    const std::wstring wn = Utf8ToWide(chosen_name);
-    fwprintf(file, L"Chen vertex probe (S4-2)\npart: %ls\nvertexCount: %d\nvertices.Length: %d\nlength match: %ls\n",
-        wn.c_str(), static_cast<int>(vc), static_cast<int>(vlen),
-        vc == vlen ? L"YES" : L"NO");
-    fwprintf(file, L"processed: %d (cap %d), failed elements: %d, time ms: %lu\n",
-        static_cast<int>(pts.size()), static_cast<int>(n), failcnt,
-        static_cast<unsigned long>(ms));
+    fwprintf(file, L"Chen vertex probe v0.5.0 (sharedMesh vs BakeMesh)\nparts: %d\n",
+        static_cast<int>(rows.size()));
+    fwprintf(file, L"%-44ls %8s %8s %10s %s\n", L"part", L"shr_vc", L"shr_len", L"bake_len", L"readable");
+    for (auto& rw : rows) {
+        const std::wstring wn = Utf8ToWide(rw.name);
+        fwprintf(file, L"%-44ls %8d %8d %10d %s\n", wn.c_str(), rw.svc, rw.slen, rw.blen,
+            rw.readable ? L"true" : L"false");
+    }
+    fwprintf(file, L"\nsampled baked part: %ls\n", Utf8ToWide(sample_name).c_str());
+    fwprintf(file, L"baked vertexCount: %d, read verts: %d, failed: %d\n",
+        sbvc, static_cast<int>(spts.size()), sfail);
     fwprintf(file, L"AABB min: %.5f %.5f %.5f\nAABB max: %.5f %.5f %.5f\nsize: %.5f %.5f %.5f\n",
-        mn.x, mn.y, mn.z, mx.x, mx.y, mx.z, mx.x - mn.x, mx.y - mn.y, mx.z - mn.z);
+        smn.x, smn.y, smn.z, smx.x, smx.y, smx.z, smx.x - smn.x, smx.y - smn.y, smx.z - smn.z);
     fwprintf(file, L"--- first 5 vertices ---\n");
-    for (int i = 0; i < 5 && i < static_cast<int>(pts.size()); ++i)
-        fwprintf(file, L"[%d] %.5f %.5f %.5f\n", i, pts[i].x, pts[i].y, pts[i].z);
+    for (int i = 0; i < 5 && i < static_cast<int>(spts.size()); ++i)
+        fwprintf(file, L"[%d] %.5f %.5f %.5f\n", i, spts[i].x, spts[i].y, spts[i].z);
     fwprintf(file, L"--- last 5 vertices ---\n");
-    int last_start = static_cast<int>(pts.size()) - 5;
-    if (last_start < 5) last_start = 5;
-    for (int i = last_start; i < static_cast<int>(pts.size()); ++i)
-        fwprintf(file, L"[%d] %.5f %.5f %.5f\n", i, pts[i].x, pts[i].y, pts[i].z);
+    int ls = static_cast<int>(spts.size()) - 5;
+    if (ls < 5) ls = 5;
+    for (int i = ls; i < static_cast<int>(spts.size()); ++i)
+        fwprintf(file, L"[%d] %.5f %.5f %.5f\n", i, spts[i].x, spts[i].y, spts[i].z);
     fclose(file);
     Log("vertex-probe FINISHED: chen_vertex_probe_*.txt written.");
 }
@@ -640,7 +680,10 @@ bool ResolveContracts() {
                        Contract("array.get_value")->resolved &&
                        Contract("skinned.get_shared_mesh")->resolved &&
                        Contract("mesh.get_vertex_count")->resolved &&
-                       Contract("mesh.get_vertices")->resolved;
+                       Contract("mesh.get_vertices")->resolved &&
+                       Contract("mesh.ctor")->resolved &&
+                       Contract("mesh.is_readable")->resolved &&
+                       Contract("skinned.bake_mesh")->resolved;
     g_contracts_ready.store(ready, std::memory_order_release);
     return ready;
 }
@@ -680,6 +723,16 @@ BE_Result BE_CALL Initialize(const BE_HostApiV1* host) {
         Log("Could not resolve UnityEngine.SkinnedMeshRenderer class.");
     }
 
+    // S4-2：解析 UnityEngine.Mesh（只取 class_info 供 object_new，烘焙出可读网格）。
+    BE_ResolvedClassV1 mesh_class{};
+    if (host->resolve_class(host->context, "UnityEngine.CoreModule.dll",
+            "UnityEngine", "Mesh", &mesh_class) == BE_Result_Ok && mesh_class.class_info) {
+        g_mesh_class_info = const_cast<void*>(mesh_class.class_info);
+        Log("Resolved support class: UnityEngine.Mesh");
+    } else {
+        Log("Could not resolve UnityEngine.Mesh class.");
+    }
+
     MethodContract* pump = Contract("pump");
     if (!pump || !pump->resolved) {
         Log("Main-thread pump contract missing; exporter cannot run.");
@@ -694,7 +747,7 @@ BE_Result BE_CALL Initialize(const BE_HostApiV1* host) {
 
     g_input_stop.store(false, std::memory_order_release);
     g_input_thread = std::thread(InputThreadMain);
-    Log("Scene Exporter v0.4.0 ready (Cameras + SkinnedMesh + Chen vertex probe). Focus the game and press Ctrl+Shift+E.");
+    Log("Scene Exporter v0.5.0 ready (Cameras + SkinnedMesh + BakeMesh vertex probe). Focus the game and press Ctrl+Shift+E.");
     return BE_Result_Ok;
 }
 
@@ -724,7 +777,7 @@ void BE_CALL Shutdown() {
 }
 
 const BE_ModuleApiV1 kApi{
-    {kModuleId, "Scene Exporter", "0.4.0", BETTER_ENDFIELD_MODULE_ABI_V1},
+    {kModuleId, "Scene Exporter", "0.5.0", BETTER_ENDFIELD_MODULE_ABI_V1},
     &Initialize, &ConfigurationChanged, &Shutdown};
 
 } // namespace
