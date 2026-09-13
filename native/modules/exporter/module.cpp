@@ -1,6 +1,6 @@
-// BetterEndfield Scene Exporter — S3 minimal link test (v0.2.1: fix reference-type Type arg passing).
+// BetterEndfield Scene Exporter — S3 minimal link test (v0.2.2: hotkey changed to Ctrl+Shift+E).
 //
-// S3 目标（只验证链路，不导网格）：游戏内按热键(F9)，在 Unity 主线程枚举
+// S3 目标（只验证链路，不导网格）：游戏内按组合热键(Ctrl+Shift+E)，在 Unity 主线程枚举
 // “当前已加载场景”里指定类型的全部对象，把数量和名字写到本地 txt。
 // 先打通 注入 -> 主线程泵 -> 静态枚举 -> 数组遍历取名字 -> 写文件 整条路。
 //
@@ -9,7 +9,7 @@
 //   Camera 链路跑通后，S4 再换成 Renderer/Mesh，并用分帧或更安全的 hook 点处理重枚举。
 //
 // ★所有 IL2CPP/托管调用都走 Safe* 封装（__try/__except SEH 兜底，对齐 model 模块）：
-//   单次坏调用只记日志、不再把整个游戏踢崩，可反复按 F9 调试。
+//   单次坏调用只记日志、不再把整个游戏踢崩，可反复按 Ctrl+Shift+E 调试。
 //
 // 架构严格对齐 camera 模块：后台线程只捕获热键(置原子请求)，一切 Unity 对象
 // 读写都在 hook 到的每帧主线程方法里执行。
@@ -298,8 +298,10 @@ bool GameWindowHasFocus() {
 void InputThreadMain() {
     bool was_down = false;
     while (!g_input_stop.load(std::memory_order_acquire)) {
-        const int hotkey = g_hotkey.load(std::memory_order_relaxed);
-        const bool down = GameWindowHasFocus() && IsKeyDown(hotkey);
+        // 组合热键 Ctrl+Shift+E（E=Export 导出）。游戏单键 F 区(F9抽卡/F10简报等)被占用，
+        // 三键组合游戏不会绑定，既不撞车也不会误触；边沿触发逻辑在下面保证按住只导出一次。
+        const bool down = GameWindowHasFocus() && IsKeyDown(VK_CONTROL) &&
+                          IsKeyDown(VK_SHIFT) && IsKeyDown('E');
         if (down && !was_down) {
             g_export_request.store(true, std::memory_order_release);
         }
@@ -375,7 +377,7 @@ BE_Result BE_CALL Initialize(const BE_HostApiV1* host) {
 
     g_input_stop.store(false, std::memory_order_release);
     g_input_thread = std::thread(InputThreadMain);
-    Log("Scene Exporter v0.2.1 ready (S3 minimal=Camera, ref-type arg fixed). Focus the game and press F9.");
+    Log("Scene Exporter v0.2.2 ready (S3 minimal=Camera). Focus the game and press Ctrl+Shift+E.");
     return BE_Result_Ok;
 }
 
@@ -400,7 +402,7 @@ void BE_CALL Shutdown() {
 }
 
 const BE_ModuleApiV1 kApi{
-    {kModuleId, "Scene Exporter", "0.2.1", BETTER_ENDFIELD_MODULE_ABI_V1},
+    {kModuleId, "Scene Exporter", "0.2.2", BETTER_ENDFIELD_MODULE_ABI_V1},
     &Initialize, &ConfigurationChanged, &Shutdown};
 
 } // namespace
