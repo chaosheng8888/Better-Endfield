@@ -154,13 +154,18 @@ set_target_properties(BetterEndfield.CombatOverlay PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${BETTER_ENDFIELD_STAGE_DIR}/modules"
 )
 
-add_executable(BetterEndfield.CombatSemanticsTests EXCLUDE_FROM_ALL
-    tests/combat_semantics_tests.cpp
-    modules/combat_stats/combat_semantics.cpp
-    modules/combat_stats/combat_semantics.h
-    modules/combat_stats/rdps_math.h
-)
-better_endfield_target_defaults(BetterEndfield.CombatSemanticsTests)
+# Upstream does not ship tests/combat_semantics_tests.cpp in the public repo.
+# Guard the test target so configure/generate succeeds from a clean checkout;
+# it reappears automatically once the missing test source is added.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/combat_semantics_tests.cpp")
+    add_executable(BetterEndfield.CombatSemanticsTests EXCLUDE_FROM_ALL
+        tests/combat_semantics_tests.cpp
+        modules/combat_stats/combat_semantics.cpp
+        modules/combat_stats/combat_semantics.h
+        modules/combat_stats/rdps_math.h
+    )
+    better_endfield_target_defaults(BetterEndfield.CombatSemanticsTests)
+endif()
 
 # Read-only research utility. It is deliberately excluded from the default
 # build and release layout; build the target explicitly when runtime metadata
