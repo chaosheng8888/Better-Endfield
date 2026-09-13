@@ -1,4 +1,4 @@
-// BetterEndfield Scene Exporter — v0.5.0 (S4-2 fix: BakeMesh readable probe across all Chen lod0 parts, diagnose sharedMesh.isReadable; hotkey Ctrl+Shift+E).
+// BetterEndfield Scene Exporter — v0.6.0 (S4-2: per-part fresh BakeMesh to avoid reused-mesh carryover, log Renderer.isVisible; hotkey Ctrl+Shift+E).
 //
 // S3 目标（只验证链路，不导网格）：游戏内按组合热键(Ctrl+Shift+E)，在 Unity 主线程枚举
 // “当前已加载场景”里指定类型的全部对象，把数量和名字写到本地 txt。
@@ -87,6 +87,10 @@ MethodContract g_contracts[]{
     {"skinned.bake_mesh",
         {"UnityEngine.CoreModule.dll", "UnityEngine", "SkinnedMeshRenderer",
             "BakeMesh", "UnityEngine.Mesh", "System.Void", 1}},
+    // S4-2 诊断：Renderer.isVisible（该部件当前是否被任意相机渲染/在画面内），定义在 Renderer 基类。
+    {"renderer.is_visible",
+        {"UnityEngine.CoreModule.dll", "UnityEngine", "Renderer",
+            "get_isVisible", nullptr, "System.Boolean", 0}},
 };
 
 using PumpFn = void(__fastcall*)(void* instance, void* method);
@@ -448,8 +452,8 @@ int32_t ArrayLengthOf(MethodContract* get_length, void* arr) {
     return len;
 }
 
-// 顶点坐标探针（v0.5.0）：收集所有 S_actor_chen_*_lod0 部件，逐个对照
-// sharedMesh（直接读；运行时网格常 isReadable=false → .vertices 返回空）与 BakeMesh 烘焙出的可读网格，
+// 顶点坐标探针（v0.6.0）：收集所有 S_actor_chen_*_lod0 部件，每个部件用独立新 Mesh 烘焙
+// （杜绝复用残留串味），对照 sharedMesh（运行时常 isReadable=false→空）与烘焙结果并记录 isVisible，
 // 写“每部件对照表”，并对第一个烘焙出非空顶点的部件完整读 xyz、算 AABB、抽样坐标验证正确性。
 void ExportVertexProbe() {
     MethodContract* find_all = Contract("object.find_all_of_type");
@@ -462,10 +466,11 @@ void ExportVertexProbe() {
     MethodContract* m_ctor = Contract("mesh.ctor");
     MethodContract* m_readable = Contract("mesh.is_readable");
     MethodContract* bake = Contract("skinned.bake_mesh");
+    MethodContract* get_visible = Contract("renderer.is_visible");
     if (!g_skinned_type || !g_mesh_class_info ||
         !find_all->resolved || !get_name->resolved || !get_length->resolved || !get_value->resolved ||
         !get_mesh->resolved || !get_vcount->resolved || !get_verts->resolved ||
-        !m_ctor->resolved || !m_readable->resolved || !bake->resolved) {
+        !m_ctor->resolved || !m_readable->resolved || !bake->resolved || !get_visible->resolved) {
         Log("vertex-probe skipped: contracts/type not ready.");
         return;
     }
@@ -506,13 +511,7 @@ void ExportVertexProbe() {
         Log(m);
     }
 
-    // 新建一个可复用的烘焙目标 Mesh，并调原生构造函数。
-    void* baked = g_host->object_new(g_host->context, g_mesh_class_info);
-    if (!baked) { Log("vertex-probe: object_new(Mesh) failed."); return; }
-    Invoke(m_ctor, baked, nullptr);
-    const uint32_t baked_handle = g_host->gchandle_new(g_host->context, baked, 0);
-
-    struct Row { std::string name; int32_t svc, slen, blen; bool readable; };
+    struct Row { std::string name; int32_t svc, slen, blen; bool readable; bool visible; };
     std::vector<Row> rows;
     bool sampled = false;
     std::string sample_name;
@@ -522,6 +521,12 @@ void ExportVertexProbe() {
 
     for (size_t pi = 0; pi < parts.size(); ++pi) {
         void* r = parts[pi].renderer;
+
+        // 该部件当前是否在任意相机画面内。
+        bool visible = false;
+        { bool vf = false, vv = false;
+          if (SafeUnbox(Invoke(get_visible, r, nullptr), &vv, sizeof(vv), &vf)) visible = vv; }
+
         void* shared = Invoke(get_mesh, r, nullptr);
         int32_t svc = -1, slen = -1;
         bool readable = false;
@@ -532,39 +537,45 @@ void ExportVertexProbe() {
             if (SafeUnbox(Invoke(m_readable, shared, nullptr), &rd, sizeof(rd), &rf)) readable = rd;
             slen = ArrayLengthOf(get_length, Invoke(get_verts, shared, nullptr));
         }
-        // 把当前蒙皮姿态烘焙进 baked（每次覆盖）。
-        void* bake_params[1]{ baked };
-        Invoke(bake, r, bake_params);
-        int32_t blen = ArrayLengthOf(get_length, Invoke(get_verts, baked, nullptr));
-        int32_t bvc = -1;
-        { bool f = false; int32_t v = 0;
-          if (SafeUnbox(Invoke(get_vcount, baked, nullptr), &v, sizeof(v), &f)) bvc = v; }
-        rows.push_back(Row{ parts[pi].name, svc, slen, blen, readable });
 
-        if (!sampled && blen > 0) {
-            sampled = true;
-            sample_name = parts[pi].name;
-            sbvc = bvc;
-            void* barr = Invoke(get_verts, baked, nullptr);
-            const int32_t n = blen < kVertCap ? blen : kVertCap;
-            spts.reserve(n);
-            for (int32_t i = 0; i < n; ++i) {
-                int32_t idx = i;
-                void* vp[1]{&idx};
-                BE_Vec3 p{0, 0, 0};
-                bool pf = false;
-                void* box = Invoke(get_value, barr, vp);
-                if (!box || !SafeUnbox(box, &p, sizeof(BE_Vec3), &pf)) { ++sfail; continue; }
-                if (spts.empty()) { smn = smx = p; }
-                else {
-                    if (p.x < smn.x) smn.x = p.x; if (p.y < smn.y) smn.y = p.y; if (p.z < smn.z) smn.z = p.z;
-                    if (p.x > smx.x) smx.x = p.x; if (p.y > smx.y) smx.y = p.y; if (p.z > smx.z) smx.z = p.z;
+        // 每个部件用一个全新烘焙 Mesh（不复用），从根上杜绝上一部件数据残留串味。
+        int32_t blen = -1, bvc = -1;
+        void* baked = g_host->object_new(g_host->context, g_mesh_class_info);
+        if (baked) {
+            Invoke(m_ctor, baked, nullptr);
+            const uint32_t bh = g_host->gchandle_new(g_host->context, baked, 0);
+            void* bake_params[1]{ baked };
+            Invoke(bake, r, bake_params);
+            blen = ArrayLengthOf(get_length, Invoke(get_verts, baked, nullptr));
+            { bool f = false; int32_t v = 0;
+              if (SafeUnbox(Invoke(get_vcount, baked, nullptr), &v, sizeof(v), &f)) bvc = v; }
+
+            if (!sampled && blen > 0) {
+                sampled = true;
+                sample_name = parts[pi].name;
+                sbvc = bvc;
+                void* barr = Invoke(get_verts, baked, nullptr);
+                const int32_t n = blen < kVertCap ? blen : kVertCap;
+                spts.reserve(n);
+                for (int32_t i = 0; i < n; ++i) {
+                    int32_t idx = i;
+                    void* vp[1]{&idx};
+                    BE_Vec3 p{0, 0, 0};
+                    bool pf = false;
+                    void* box = Invoke(get_value, barr, vp);
+                    if (!box || !SafeUnbox(box, &p, sizeof(BE_Vec3), &pf)) { ++sfail; continue; }
+                    if (spts.empty()) { smn = smx = p; }
+                    else {
+                        if (p.x < smn.x) smn.x = p.x; if (p.y < smn.y) smn.y = p.y; if (p.z < smn.z) smn.z = p.z;
+                        if (p.x > smx.x) smx.x = p.x; if (p.y > smx.y) smx.y = p.y; if (p.z > smx.z) smx.z = p.z;
+                    }
+                    spts.push_back(p);
                 }
-                spts.push_back(p);
             }
+            if (bh) g_host->gchandle_free(g_host->context, bh);
         }
+        rows.push_back(Row{ parts[pi].name, svc, slen, blen, readable, visible });
     }
-    if (baked_handle) g_host->gchandle_free(g_host->context, baked_handle);
 
     int shared_nonempty = 0, baked_nonempty = 0;
     for (auto& rw : rows) { if (rw.slen > 0) ++shared_nonempty; if (rw.blen > 0) ++baked_nonempty; }
@@ -593,13 +604,13 @@ void ExportVertexProbe() {
         Log("vertex-probe: open output file fail.");
         return;
     }
-    fwprintf(file, L"Chen vertex probe v0.5.0 (sharedMesh vs BakeMesh)\nparts: %d\n",
+    fwprintf(file, L"Chen vertex probe v0.6.0 (per-part fresh BakeMesh)\nparts: %d\n",
         static_cast<int>(rows.size()));
-    fwprintf(file, L"%-44ls %8s %8s %10s %s\n", L"part", L"shr_vc", L"shr_len", L"bake_len", L"readable");
+    fwprintf(file, L"%-40ls %7s %7s %8s %9s %7s\n", L"part", L"shr_vc", L"shr_len", L"bake_len", L"readabl", L"visible");
     for (auto& rw : rows) {
         const std::wstring wn = Utf8ToWide(rw.name);
-        fwprintf(file, L"%-44ls %8d %8d %10d %s\n", wn.c_str(), rw.svc, rw.slen, rw.blen,
-            rw.readable ? L"true" : L"false");
+        fwprintf(file, L"%-40ls %7d %7d %8d %9s %7s\n", wn.c_str(), rw.svc, rw.slen, rw.blen,
+            rw.readable ? L"true" : L"false", rw.visible ? L"true" : L"false");
     }
     fwprintf(file, L"\nsampled baked part: %ls\n", Utf8ToWide(sample_name).c_str());
     fwprintf(file, L"baked vertexCount: %d, read verts: %d, failed: %d\n",
@@ -683,7 +694,8 @@ bool ResolveContracts() {
                        Contract("mesh.get_vertices")->resolved &&
                        Contract("mesh.ctor")->resolved &&
                        Contract("mesh.is_readable")->resolved &&
-                       Contract("skinned.bake_mesh")->resolved;
+                       Contract("skinned.bake_mesh")->resolved &&
+                       Contract("renderer.is_visible")->resolved;
     g_contracts_ready.store(ready, std::memory_order_release);
     return ready;
 }
@@ -747,7 +759,7 @@ BE_Result BE_CALL Initialize(const BE_HostApiV1* host) {
 
     g_input_stop.store(false, std::memory_order_release);
     g_input_thread = std::thread(InputThreadMain);
-    Log("Scene Exporter v0.5.0 ready (Cameras + SkinnedMesh + BakeMesh vertex probe). Focus the game and press Ctrl+Shift+E.");
+    Log("Scene Exporter v0.6.0 ready (Cameras + SkinnedMesh + per-part BakeMesh vertex probe). Focus the game and press Ctrl+Shift+E.");
     return BE_Result_Ok;
 }
 
@@ -777,7 +789,7 @@ void BE_CALL Shutdown() {
 }
 
 const BE_ModuleApiV1 kApi{
-    {kModuleId, "Scene Exporter", "0.5.0", BETTER_ENDFIELD_MODULE_ABI_V1},
+    {kModuleId, "Scene Exporter", "0.6.0", BETTER_ENDFIELD_MODULE_ABI_V1},
     &Initialize, &ConfigurationChanged, &Shutdown};
 
 } // namespace
