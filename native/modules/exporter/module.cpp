@@ -1,4 +1,4 @@
-// BetterEndfield Scene Exporter — v0.7.1 (S4-2: Mesh.MeshDataArray read-only direct channel
+// BetterEndfield Scene Exporter — v0.7.2 (S4-2: Mesh.MeshDataArray read-only direct channel
 // CopyAttributeIntoPtr with checkReadWrite=false to bypass isReadable=false GPU-resident meshes;
 // keep per-part BakeMesh as cross-check; hotkey Ctrl+E).
 //
@@ -568,13 +568,21 @@ void ExportVertexProbe() {
             slen = ArrayLengthOf(get_length, Invoke(get_verts, shared, nullptr));
         }
 
-        // v0.7.0 MeshData 只读直读：对 sharedMesh 直接取绑定姿态(T-pose)顶点，绕开 isReadable=false。
+        // v0.7.2 MeshData 只读直读 + 逐步诊断日志（定位运行时断点）。
         int32_t mdvc = -1;
         bool mdok = false;
-        if (shared && g_mda_class_info && mda_ctor->resolved && mda_dispose->resolved &&
-            md_vcount->resolved && md_copy->resolved) {
+        auto mdlog = [&](const char* stage) {
+            char dbg[256];
+            std::snprintf(dbg, sizeof(dbg), "md-stage[%s] %s", parts[pi].name.c_str(), stage);
+            Log(dbg);
+        };
+        if (!(shared && g_mda_class_info && mda_ctor->resolved && mda_dispose->resolved &&
+              md_vcount->resolved && md_copy->resolved)) {
+            mdlog("guard-fail contract/class/shared null");
+        } else {
             void* boxed_mda = g_host->object_new(g_host->context, g_mda_class_info);
-            if (boxed_mda) {
+            if (!boxed_mda) { mdlog("new-boxed=null"); }
+            else {
                 bool check_rw = false, cf = false;
                 void* cp[2]{ shared, &check_rw };
                 SafeRuntimeInvoke(mda_ctor->method_info, boxed_mda, cp, nullptr, &cf);
@@ -582,45 +590,71 @@ void ExportVertexProbe() {
                 struct MDA { void** ptrs; int32_t len; };
                 MDA mda{ nullptr, 0 };
                 bool uf = false;
-                if (!cf && SafeUnbox(boxed_mda, &mda, sizeof(mda), &uf) &&
-                    mda.ptrs != nullptr && mda.len >= 1 && mda.ptrs[0] != nullptr) {
-                    void* self = mda.ptrs[0]; // 第一个 MeshData 的内部指针
-                    void* vp[1]{ &self };
-                    bool vf2 = false;
-                    void* vc_ret = SafeRuntimeInvoke(md_vcount->method_info, nullptr, vp, nullptr, &vf2);
-                    if (!vf2 && SafeUnbox(vc_ret, &mdvc, sizeof(mdvc), &vf2) && mdvc > 0) {
-                        const size_t bytes = static_cast<size_t>(mdvc) * sizeof(BE_Vec3);
-                        void* dst = HeapAlloc(GetProcessHeap(), 0, bytes);
-                        if (dst) {
-                            // 0xFF 填充后每个 float 是 NaN 哨兵；只有被真实顶点覆盖首点才会变有限数。
-                            std::memset(dst, 0xFF, bytes);
-                            int32_t attr = 0 /*Position*/, fmt = 0 /*Float32*/, dim = 3;
-                            bool pf = false;
-                            void* pp[5]{ &self, &attr, &fmt, &dim, &dst };
-                            SafeRuntimeInvoke(md_copy->method_info, nullptr, pp, nullptr, &pf);
-                            const BE_Vec3* vv = static_cast<const BE_Vec3*>(dst);
-                            if (!pf && std::isfinite(vv[0].x) &&
-                                std::isfinite(vv[0].y) && std::isfinite(vv[0].z)) {
-                                mdok = true;
-                                // MeshData 通道优先抽样（绑定姿态=模型局部坐标、真实形状）。
-                                if (!sampled) {
-                                    sampled = true;
-                                    sample_name = parts[pi].name;
-                                    sbvc = mdvc;
-                                    const int32_t n = mdvc < kVertCap ? mdvc : kVertCap;
-                                    spts.reserve(n);
-                                    for (int32_t vi = 0; vi < n; ++vi) {
-                                        BE_Vec3 p = vv[vi];
-                                        if (spts.empty()) { smn = smx = p; }
-                                        else {
-                                            if (p.x < smn.x) smn.x = p.x; if (p.y < smn.y) smn.y = p.y; if (p.z < smn.z) smn.z = p.z;
-                                            if (p.x > smx.x) smx.x = p.x; if (p.y > smx.y) smx.y = p.y; if (p.z > smx.z) smx.z = p.z;
+                bool unboxed = (!cf) && SafeUnbox(boxed_mda, &mda, sizeof(mda), &uf);
+                if (cf) { mdlog("ctor threw csharp-exception"); }
+                else if (!unboxed || uf) { mdlog("unbox-fail"); }
+                else {
+                    char ib[200];
+                    std::snprintf(ib, sizeof(ib), "unbox-ok len=%d ptrs=%p p0=%p", mda.len,
+                        static_cast<void*>(mda.ptrs),
+                        mda.ptrs ? static_cast<void*>(mda.ptrs[0]) : nullptr);
+                    mdlog(ib);
+                    if (!(mda.ptrs != nullptr && mda.len >= 1 && mda.ptrs[0] != nullptr)) {
+                        mdlog("ptrs-invalid");
+                    } else {
+                        void* self = mda.ptrs[0]; // 第一个 MeshData 的内部指针
+                        void* vp[1]{ &self };
+                        bool vf2 = false;
+                        void* vc_ret = SafeRuntimeInvoke(md_vcount->method_info, nullptr, vp, nullptr, &vf2);
+                        if (vf2 || !vc_ret) { mdlog("vcount invoke-fail"); }
+                        else {
+                            bool uf2 = false;
+                            bool vok = SafeUnbox(vc_ret, &mdvc, sizeof(mdvc), &uf2);
+                            if (!vok || uf2) { mdlog("vcount unbox-fail"); }
+                            else if (mdvc <= 0) {
+                                char tb[128]; std::snprintf(tb, sizeof(tb), "vcount non-positive=%d", mdvc);
+                                mdlog(tb);
+                            } else {
+                                const size_t bytes = static_cast<size_t>(mdvc) * sizeof(BE_Vec3);
+                                void* dst = HeapAlloc(GetProcessHeap(), 0, bytes);
+                                if (!dst) { mdlog("heap-alloc-fail"); }
+                                else {
+                                    // 0xFF 填充后每个 float 是 NaN 哨兵；只有被真实顶点覆盖首点才会变有限数。
+                                    std::memset(dst, 0xFF, bytes);
+                                    int32_t attr = 0 /*Position*/, fmt = 0 /*Float32*/, dim = 3;
+                                    bool pf = false;
+                                    void* pp[5]{ &self, &attr, &fmt, &dim, &dst };
+                                    SafeRuntimeInvoke(md_copy->method_info, nullptr, pp, nullptr, &pf);
+                                    const BE_Vec3* vv = static_cast<const BE_Vec3*>(dst);
+                                    if (pf) { mdlog("copy threw csharp-exception"); }
+                                    else if (!(std::isfinite(vv[0].x) && std::isfinite(vv[0].y) &&
+                                               std::isfinite(vv[0].z))) {
+                                        mdlog("first-vertex NaN not-written");
+                                    } else {
+                                        mdok = true;
+                                        char okb[160]; std::snprintf(okb, sizeof(okb), "OK vc=%d", mdvc);
+                                        mdlog(okb);
+                                        // MeshData 通道优先抽样（绑定姿态=模型局部坐标、真实形状）。
+                                        if (!sampled) {
+                                            sampled = true;
+                                            sample_name = parts[pi].name;
+                                            sbvc = mdvc;
+                                            const int32_t n = mdvc < kVertCap ? mdvc : kVertCap;
+                                            spts.reserve(n);
+                                            for (int32_t vi = 0; vi < n; ++vi) {
+                                                BE_Vec3 p = vv[vi];
+                                                if (spts.empty()) { smn = smx = p; }
+                                                else {
+                                                    if (p.x < smn.x) smn.x = p.x; if (p.y < smn.y) smn.y = p.y; if (p.z < smn.z) smn.z = p.z;
+                                                    if (p.x > smx.x) smx.x = p.x; if (p.y > smx.y) smx.y = p.y; if (p.z > smx.z) smx.z = p.z;
+                                                }
+                                                spts.push_back(p);
+                                            }
                                         }
-                                        spts.push_back(p);
                                     }
+                                    HeapFree(GetProcessHeap(), 0, dst);
                                 }
                             }
-                            HeapFree(GetProcessHeap(), 0, dst);
                         }
                     }
                 }
@@ -694,7 +728,7 @@ void ExportVertexProbe() {
         Log("vertex-probe: open output file fail.");
         return;
     }
-    fwprintf(file, L"Chen vertex probe v0.7.1 (MeshData direct + BakeMesh cross-check)\nparts: %d\n",
+    fwprintf(file, L"Chen vertex probe v0.7.2 (MeshData direct + BakeMesh cross-check)\nparts: %d\n",
         static_cast<int>(rows.size()));
     fwprintf(file, L"%-40ls %7s %7s %8s %7s %6s %9s %7s\n", L"part", L"shr_vc", L"shr_len", L"bake_len", L"md_vc", L"md_ok", L"readabl", L"visible");
     for (auto& rw : rows) {
@@ -858,7 +892,7 @@ BE_Result BE_CALL Initialize(const BE_HostApiV1* host) {
 
     g_input_stop.store(false, std::memory_order_release);
     g_input_thread = std::thread(InputThreadMain);
-    Log("Scene Exporter v0.7.1 ready (Cameras + SkinnedMesh + MeshData direct vertex channel + BakeMesh cross-check). Focus the game and press Ctrl+E.");
+    Log("Scene Exporter v0.7.2 ready (Cameras + SkinnedMesh + MeshData direct vertex channel + step diagnostics). Focus the game and press Ctrl+E.");
     return BE_Result_Ok;
 }
 
@@ -888,7 +922,7 @@ void BE_CALL Shutdown() {
 }
 
 const BE_ModuleApiV1 kApi{
-    {kModuleId, "Scene Exporter", "0.7.1", BETTER_ENDFIELD_MODULE_ABI_V1},
+    {kModuleId, "Scene Exporter", "0.7.2", BETTER_ENDFIELD_MODULE_ABI_V1},
     &Initialize, &ConfigurationChanged, &Shutdown};
 
 } // namespace
