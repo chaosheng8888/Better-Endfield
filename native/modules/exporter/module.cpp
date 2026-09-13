@@ -1,4 +1,4 @@
-// BetterEndfield Scene Exporter — S3 minimal link test (v0.2.2: hotkey changed to Ctrl+Shift+E).
+// BetterEndfield Scene Exporter — v0.3.0 (S3 cameras + S4 layer1 SkinnedMeshRenderer.sharedMesh/vertexCount; hotkey Ctrl+Shift+E).
 //
 // S3 目标（只验证链路，不导网格）：游戏内按组合热键(Ctrl+Shift+E)，在 Unity 主线程枚举
 // “当前已加载场景”里指定类型的全部对象，把数量和名字写到本地 txt。
@@ -24,6 +24,7 @@
 #include <cstring>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace BetterEndfield::Exporter {
@@ -62,14 +63,25 @@ MethodContract g_contracts[]{
     {"array.get_value",
         {"mscorlib.dll", "System", "Array",
             "GetValue", "System.Int32", "System.Object", 1}},
+    // S4-1 实例属性 getter：SkinnedMeshRenderer.get_sharedMesh() -> Mesh（无参）。
+    {"skinned.get_shared_mesh",
+        {"UnityEngine.CoreModule.dll", "UnityEngine", "SkinnedMeshRenderer",
+            "get_sharedMesh", nullptr, "UnityEngine.Mesh", 0}},
+    // S4-1 实例属性 getter：Mesh.get_vertexCount() -> int（无参，值类型返回需 unbox）。
+    {"mesh.get_vertex_count",
+        {"UnityEngine.CoreModule.dll", "UnityEngine", "Mesh",
+            "get_vertexCount", nullptr, "System.Int32", 0}},
 };
 
 using PumpFn = void(__fastcall*)(void* instance, void* method);
 PumpFn g_original_pump = nullptr;
 
-// S3 最小验证目标：UnityEngine.Camera 的 System.Type 托管对象（S4 再换 Renderer）。
+// S3 验证目标：UnityEngine.Camera 的 System.Type 托管对象。
 void* g_target_type = nullptr;
 uint32_t g_target_type_root = 0; // GC 保活句柄
+// S4-1 目标：UnityEngine.SkinnedMeshRenderer 的 System.Type 托管对象。
+void* g_skinned_type = nullptr;
+uint32_t g_skinned_type_root = 0;
 
 std::atomic_bool g_export_request{false};
 std::atomic_int g_hotkey{VK_F9};
@@ -176,8 +188,8 @@ std::wstring Utf8ToWide(const std::string& text) {
     return wide;
 }
 
-// 只在 Unity 主线程调用（由 DetourPump 触发）。
-void RunExportOnMainThread() {
+// 只在 Unity 主线程调用（由 DetourPump 触发）。导出相机（S3 已跑通，作为“管道存活”哨兵）。
+void ExportCameras() {
     MethodContract* find_all = Contract("object.find_all_of_type");
     MethodContract* get_name = Contract("object.get_name");
     MethodContract* get_length = Contract("array.get_length");
@@ -282,6 +294,131 @@ void RunExportOnMainThread() {
     Log(done);
 }
 
+// ===========================================================================
+// S4 第一层：枚举当前场景全部 SkinnedMeshRenderer（蒙皮网格，主要是在场角色/怪物，
+// 数量可控，不会像静态 MeshFilter 那样上万），对每个：get_sharedMesh 拿到网格，
+// 再 get_vertexCount 读顶点数，写“名字 + 顶点数”。验证 渲染器→共享网格→几何规模 这条数据链。
+// 所有 IL2CPP 调用都走 Invoke/SafeUnbox/SafeCopyName（内部 SEH 兜底），本函数可正常用 C++ 容器。
+// ===========================================================================
+void ExportSkinnedMeshes() {
+    MethodContract* find_all = Contract("object.find_all_of_type");
+    MethodContract* get_name = Contract("object.get_name");
+    MethodContract* get_length = Contract("array.get_length");
+    MethodContract* get_value = Contract("array.get_value");
+    MethodContract* get_mesh = Contract("skinned.get_shared_mesh");
+    MethodContract* get_vcount = Contract("mesh.get_vertex_count");
+    if (!g_skinned_type || !find_all->resolved || !get_name->resolved ||
+        !get_length->resolved || !get_value->resolved ||
+        !get_mesh->resolved || !get_vcount->resolved) {
+        Log("Skinned export skipped: required contracts/type not fully resolved.");
+        return;
+    }
+
+    Log("skinned step 1/4: FindObjectsOfType(SkinnedMeshRenderer) ...");
+    void* find_params[1]{ g_skinned_type }; // System.Type 引用类型，直接放对象指针
+    void* objects = Invoke(find_all, nullptr /* 静态 */, find_params);
+    if (!objects) { Log("skinned step 1 failed or nothing."); return; }
+
+    int32_t dimension = 0;
+    void* len_params[1]{&dimension};
+    int32_t count = 0;
+    bool len_fault = false;
+    void* len_boxed = Invoke(get_length, objects, len_params);
+    if (!SafeUnbox(len_boxed, &count, sizeof(count), &len_fault)) {
+        Log("skinned step 2 failed: Array.GetLength.");
+        return;
+    }
+    char lm[96];
+    std::snprintf(lm, sizeof(lm), "skinned step 2 ok: SkinnedMeshRenderer count = %d",
+        static_cast<int>(count));
+    Log(lm);
+    if (count < 0 || count > 200000) {
+        Log("skinned step 2 aborted: implausible count.");
+        return;
+    }
+
+    // 单帧处理上限，防意外数量卡顿；总数仍如实写出。
+    const int32_t kProcessCap = 2000;
+    const int32_t process = count < kProcessCap ? count : kProcessCap;
+
+    struct Row { std::string name; int32_t verts; bool has_mesh; };
+    std::vector<Row> rows;
+    rows.reserve(static_cast<size_t>(process));
+    long long total_verts = 0;
+
+    Log("skinned step 3/4: reading sharedMesh and vertexCount per renderer ...");
+    for (int32_t i = 0; i < process; ++i) {
+        int32_t index = i;
+        void* index_params[1]{&index};
+        void* renderer = Invoke(get_value, objects, index_params);
+        Row row;
+        row.verts = 0;
+        row.has_mesh = false;
+        if (!renderer) { row.name = "<null>"; rows.push_back(std::move(row)); continue; }
+
+        char nb[256]{};
+        bool nf = false;
+        void* name_obj = Invoke(get_name, renderer, nullptr);
+        if (!nf && SafeCopyName(name_obj, nb, sizeof(nb), &nf) > 0) row.name = nb;
+        else row.name = "<unnamed>";
+
+        void* mesh = Invoke(get_mesh, renderer, nullptr); // 实例、无参
+        if (mesh) {
+            row.has_mesh = true;
+            int32_t vc = 0;
+            bool vf = false;
+            void* vc_boxed = Invoke(get_vcount, mesh, nullptr); // 实例、无参，返回 boxed int
+            if (SafeUnbox(vc_boxed, &vc, sizeof(vc), &vf)) {
+                row.verts = vc;
+                total_verts += vc;
+            }
+        }
+        rows.push_back(std::move(row));
+    }
+
+    Log("skinned step 4/4: writing text file ...");
+    wchar_t local_app_data[MAX_PATH];
+    const DWORD got = GetEnvironmentVariableW(L"LOCALAPPDATA", local_app_data, MAX_PATH);
+    if (got == 0 || got >= MAX_PATH) return;
+    const std::wstring be_root = std::wstring(local_app_data) + L"\\BetterEndfield";
+    const std::wstring dir = be_root + L"\\scene-export";
+    CreateDirectoryW(be_root.c_str(), nullptr);
+    CreateDirectoryW(dir.c_str(), nullptr);
+
+    wchar_t path[MAX_PATH * 2];
+    swprintf_s(path, _countof(path), L"%ls\\skinned_meshes_%llu.txt", dir.c_str(),
+        static_cast<unsigned long long>(GetTickCount64()));
+    FILE* file = nullptr;
+    if (_wfopen_s(&file, path, L"w, ccs=UTF-8") != 0 || !file) {
+        Log("skinned: cannot open output file.");
+        return;
+    }
+    fwprintf(file,
+        L"BetterEndfield SkinnedMeshRenderer count: %d (processed %d), total vertices: %lld\n",
+        count, process, total_verts);
+    for (int32_t i = 0; i < static_cast<int32_t>(rows.size()); ++i) {
+        const std::wstring wn = Utf8ToWide(rows[static_cast<size_t>(i)].name);
+        if (rows[i].has_mesh)
+            fwprintf(file, L"[%d] %ls  verts=%d\n", i, wn.c_str(), rows[i].verts);
+        else
+            fwprintf(file, L"[%d] %ls  (no sharedMesh)\n", i, wn.c_str());
+    }
+    fclose(file);
+
+    char done[160];
+    std::snprintf(done, sizeof(done),
+        "Skinned export FINISHED: %d renderers processed, total vertices=%lld.",
+        static_cast<int>(rows.size()), total_verts);
+    Log(done);
+}
+
+// 热键总入口（只在主线程）：先导相机（哨兵，证明基础管道活着），再导蒙皮网格（S4 第一层）。
+// 两段相互独立；所有 IL2CPP 调用内部已有 SEH 兜底，这里不再包 __try（本函数无 C++ 析构对象也保持简单）。
+void RunExportOnMainThread() {
+    ExportCameras();
+    ExportSkinnedMeshes();
+}
+
 bool IsKeyDown(int virtual_key) {
     return (GetAsyncKeyState(virtual_key) & 0x8000) != 0;
 }
@@ -335,7 +472,9 @@ bool ResolveContracts() {
                        Contract("object.find_all_of_type")->resolved &&
                        Contract("object.get_name")->resolved &&
                        Contract("array.get_length")->resolved &&
-                       Contract("array.get_value")->resolved;
+                       Contract("array.get_value")->resolved &&
+                       Contract("skinned.get_shared_mesh")->resolved &&
+                       Contract("mesh.get_vertex_count")->resolved;
     g_contracts_ready.store(ready, std::memory_order_release);
     return ready;
 }
@@ -363,6 +502,18 @@ BE_Result BE_CALL Initialize(const BE_HostApiV1* host) {
         Log("Could not resolve UnityEngine.Camera class.");
     }
 
+    // S4-1 目标类型：UnityEngine.SkinnedMeshRenderer（蒙皮网格渲染器）。
+    BE_ResolvedClassV1 skinned_class{};
+    if (host->resolve_class(host->context, "UnityEngine.CoreModule.dll",
+            "UnityEngine", "SkinnedMeshRenderer", &skinned_class) == BE_Result_Ok &&
+        skinned_class.type_object) {
+        g_skinned_type = skinned_class.type_object;
+        g_skinned_type_root = host->gchandle_new(host->context, g_skinned_type, 0);
+        Log("Resolved target class: UnityEngine.SkinnedMeshRenderer");
+    } else {
+        Log("Could not resolve UnityEngine.SkinnedMeshRenderer class.");
+    }
+
     MethodContract* pump = Contract("pump");
     if (!pump || !pump->resolved) {
         Log("Main-thread pump contract missing; exporter cannot run.");
@@ -377,7 +528,7 @@ BE_Result BE_CALL Initialize(const BE_HostApiV1* host) {
 
     g_input_stop.store(false, std::memory_order_release);
     g_input_thread = std::thread(InputThreadMain);
-    Log("Scene Exporter v0.2.2 ready (S3 minimal=Camera). Focus the game and press Ctrl+Shift+E.");
+    Log("Scene Exporter v0.3.0 ready (Cameras + SkinnedMesh vertexCount). Focus the game and press Ctrl+Shift+E.");
     return BE_Result_Ok;
 }
 
@@ -395,14 +546,19 @@ void BE_CALL Shutdown() {
         if (g_target_type_root && g_host->gchandle_free) {
             g_host->gchandle_free(g_host->context, g_target_type_root);
         }
+        if (g_skinned_type_root && g_host->gchandle_free) {
+            g_host->gchandle_free(g_host->context, g_skinned_type_root);
+        }
     }
     g_target_type_root = 0;
     g_target_type = nullptr;
+    g_skinned_type_root = 0;
+    g_skinned_type = nullptr;
     g_host = nullptr;
 }
 
 const BE_ModuleApiV1 kApi{
-    {kModuleId, "Scene Exporter", "0.2.2", BETTER_ENDFIELD_MODULE_ABI_V1},
+    {kModuleId, "Scene Exporter", "0.3.0", BETTER_ENDFIELD_MODULE_ABI_V1},
     &Initialize, &ConfigurationChanged, &Shutdown};
 
 } // namespace
