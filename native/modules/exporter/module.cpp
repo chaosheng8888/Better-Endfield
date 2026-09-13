@@ -1,6 +1,8 @@
-// BetterEndfield Scene Exporter — v0.6.0 (S4-2: per-part fresh BakeMesh to avoid reused-mesh carryover, log Renderer.isVisible; hotkey Ctrl+Shift+E).
+// BetterEndfield Scene Exporter — v0.7.0 (S4-2: add Mesh.MeshDataArray read-only direct channel
+// CopyAttributeIntoPtr with checkReadWrite=false to bypass isReadable=false GPU-resident meshes;
+// keep per-part BakeMesh as cross-check; hotkey Ctrl+E).
 //
-// S3 目标（只验证链路，不导网格）：游戏内按组合热键(Ctrl+Shift+E)，在 Unity 主线程枚举
+// S3 目标（只验证链路，不导网格）：游戏内按组合热键(Ctrl+E)，在 Unity 主线程枚举
 // “当前已加载场景”里指定类型的全部对象，把数量和名字写到本地 txt。
 // 先打通 注入 -> 主线程泵 -> 静态枚举 -> 数组遍历取名字 -> 写文件 整条路。
 //
@@ -9,7 +11,7 @@
 //   Camera 链路跑通后，S4 再换成 Renderer/Mesh，并用分帧或更安全的 hook 点处理重枚举。
 //
 // ★所有 IL2CPP/托管调用都走 Safe* 封装（__try/__except SEH 兜底，对齐 model 模块）：
-//   单次坏调用只记日志、不再把整个游戏踢崩，可反复按 Ctrl+Shift+E 调试。
+//   单次坏调用只记日志、不再把整个游戏踢崩，可反复按 Ctrl+E 调试。
 //
 // 架构严格对齐 camera 模块：后台线程只捕获热键(置原子请求)，一切 Unity 对象
 // 读写都在 hook 到的每帧主线程方法里执行。
@@ -22,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <string>
 #include <thread>
 #include <utility>
@@ -91,6 +94,26 @@ MethodContract g_contracts[]{
     {"renderer.is_visible",
         {"UnityEngine.CoreModule.dll", "UnityEngine", "Renderer",
             "get_isVisible", nullptr, "System.Boolean", 0}},
+    // v0.7.0 MeshData 只读直读通道（绕开 isReadable=false）。嵌套类用“外层.内层”点号写法。
+    // MeshDataArray..ctor(Mesh mesh, bool checkReadWrite)：checkReadWrite=false 跳过可读标志检查。
+    {"mda.ctor",
+        {"UnityEngine.CoreModule.dll", "UnityEngine", "Mesh.MeshDataArray",
+            ".ctor", "UnityEngine.Mesh,System.Boolean", "System.Void", 2}},
+    // MeshDataArray.Dispose()：读完必须释放对原生顶点缓冲的锁定。
+    {"mda.dispose",
+        {"UnityEngine.CoreModule.dll", "UnityEngine", "Mesh.MeshDataArray",
+            "Dispose", nullptr, "System.Void", 0}},
+    // MeshData.GetVertexCount(IntPtr self) -> int（Injected 静态风格，self=内部指针显式传）。
+    {"md.vcount",
+        {"UnityEngine.CoreModule.dll", "UnityEngine", "Mesh.MeshData",
+            "GetVertexCount", "System.IntPtr", "System.Int32", 1}},
+    // MeshData.CopyAttributeIntoPtr(self, Position=0, Float32=0, dim=3, dst)：
+    // 直接把全部顶点的 Position（每点12字节）连续拷进我方原生缓冲区，不经托管数组/泛型。
+    {"md.copy_pos",
+        {"UnityEngine.CoreModule.dll", "UnityEngine", "Mesh.MeshData",
+            "CopyAttributeIntoPtr",
+            "System.IntPtr,UnityEngine.Rendering.VertexAttribute,UnityEngine.Rendering.VertexAttributeFormat,System.Int32,System.IntPtr",
+            "System.Void", 5}},
 };
 
 using PumpFn = void(__fastcall*)(void* instance, void* method);
@@ -104,6 +127,8 @@ void* g_skinned_type = nullptr;
 uint32_t g_skinned_type_root = 0;
 // S4-2：UnityEngine.Mesh 的原生类信息（class_info，用于 object_new 新建烘焙网格；元数据不需 GC 保活）。
 void* g_mesh_class_info = nullptr;
+// v0.7.0：UnityEngine.Mesh.MeshDataArray 嵌套类信息（object_new 装箱后调 .ctor 拿只读网格数据）。
+void* g_mda_class_info = nullptr;
 
 std::atomic_bool g_export_request{false};
 std::atomic_int g_hotkey{VK_F9};
@@ -452,7 +477,7 @@ int32_t ArrayLengthOf(MethodContract* get_length, void* arr) {
     return len;
 }
 
-// 顶点坐标探针（v0.6.0）：收集所有 S_actor_chen_*_lod0 部件，每个部件用独立新 Mesh 烘焙
+// 顶点坐标探针（v0.7.0）：收集所有 S_actor_chen_*_lod0 部件，优先走 MeshData 只读直读，
 // （杜绝复用残留串味），对照 sharedMesh（运行时常 isReadable=false→空）与烘焙结果并记录 isVisible，
 // 写“每部件对照表”，并对第一个烘焙出非空顶点的部件完整读 xyz、算 AABB、抽样坐标验证正确性。
 void ExportVertexProbe() {
@@ -467,6 +492,10 @@ void ExportVertexProbe() {
     MethodContract* m_readable = Contract("mesh.is_readable");
     MethodContract* bake = Contract("skinned.bake_mesh");
     MethodContract* get_visible = Contract("renderer.is_visible");
+    MethodContract* mda_ctor = Contract("mda.ctor");
+    MethodContract* mda_dispose = Contract("mda.dispose");
+    MethodContract* md_vcount = Contract("md.vcount");
+    MethodContract* md_copy = Contract("md.copy_pos");
     if (!g_skinned_type || !g_mesh_class_info ||
         !find_all->resolved || !get_name->resolved || !get_length->resolved || !get_value->resolved ||
         !get_mesh->resolved || !get_vcount->resolved || !get_verts->resolved ||
@@ -511,7 +540,7 @@ void ExportVertexProbe() {
         Log(m);
     }
 
-    struct Row { std::string name; int32_t svc, slen, blen; bool readable; bool visible; };
+    struct Row { std::string name; int32_t svc, slen, blen, mdvc; bool readable, visible, mdok; };
     std::vector<Row> rows;
     bool sampled = false;
     std::string sample_name;
@@ -536,6 +565,66 @@ void ExportVertexProbe() {
             bool rf = false, rd = false;
             if (SafeUnbox(Invoke(m_readable, shared, nullptr), &rd, sizeof(rd), &rf)) readable = rd;
             slen = ArrayLengthOf(get_length, Invoke(get_verts, shared, nullptr));
+        }
+
+        // v0.7.0 MeshData 只读直读：对 sharedMesh 直接取绑定姿态(T-pose)顶点，绕开 isReadable=false。
+        int32_t mdvc = -1;
+        bool mdok = false;
+        if (shared && g_mda_class_info && mda_ctor->resolved && mda_dispose->resolved &&
+            md_vcount->resolved && md_copy->resolved) {
+            void* boxed_mda = g_host->object_new(g_host->context, g_mda_class_info);
+            if (boxed_mda) {
+                bool check_rw = false, cf = false;
+                void* cp[2]{ shared, &check_rw };
+                SafeRuntimeInvoke(mda_ctor->method_info, boxed_mda, cp, nullptr, &cf);
+                // unbox 后字段起点：m_Ptrs@0(IntPtr*)、m_Length@8(int)（dump 标注 0x10/0x18 已含对象头）。
+                struct MDA { void** ptrs; int32_t len; };
+                MDA mda{ nullptr, 0 };
+                bool uf = false;
+                if (!cf && SafeUnbox(boxed_mda, &mda, sizeof(mda), &uf) &&
+                    mda.ptrs != nullptr && mda.len >= 1 && mda.ptrs[0] != nullptr) {
+                    void* self = mda.ptrs[0]; // 第一个 MeshData 的内部指针
+                    void* vp[1]{ &self };
+                    bool vf2 = false;
+                    void* vc_ret = SafeRuntimeInvoke(md_vcount->method_info, nullptr, vp, nullptr, &vf2);
+                    if (!vf2 && SafeUnbox(vc_ret, &mdvc, sizeof(mdvc), &vf2) && mdvc > 0) {
+                        const size_t bytes = static_cast<size_t>(mdvc) * sizeof(BE_Vec3);
+                        void* dst = HeapAlloc(GetProcessHeap(), 0, bytes);
+                        if (dst) {
+                            // 0xFF 填充后每个 float 是 NaN 哨兵；只有被真实顶点覆盖首点才会变有限数。
+                            std::memset(dst, 0xFF, bytes);
+                            int32_t attr = 0 /*Position*/, fmt = 0 /*Float32*/, dim = 3;
+                            bool pf = false;
+                            void* pp[5]{ &self, &attr, &fmt, &dim, &dst };
+                            SafeRuntimeInvoke(md_copy->method_info, nullptr, pp, nullptr, &pf);
+                            const BE_Vec3* vv = static_cast<const BE_Vec3*>(dst);
+                            if (!pf && std::isfinite(vv[0].x) &&
+                                std::isfinite(vv[0].y) && std::isfinite(vv[0].z)) {
+                                mdok = true;
+                                // MeshData 通道优先抽样（绑定姿态=模型局部坐标、真实形状）。
+                                if (!sampled) {
+                                    sampled = true;
+                                    sample_name = parts[pi].name;
+                                    sbvc = mdvc;
+                                    const int32_t n = mdvc < kVertCap ? mdvc : kVertCap;
+                                    spts.reserve(n);
+                                    for (int32_t vi = 0; vi < n; ++vi) {
+                                        BE_Vec3 p = vv[vi];
+                                        if (spts.empty()) { smn = smx = p; }
+                                        else {
+                                            if (p.x < smn.x) smn.x = p.x; if (p.y < smn.y) smn.y = p.y; if (p.z < smn.z) smn.z = p.z;
+                                            if (p.x > smx.x) smx.x = p.x; if (p.y > smx.y) smx.y = p.y; if (p.z > smx.z) smx.z = p.z;
+                                        }
+                                        spts.push_back(p);
+                                    }
+                                }
+                            }
+                            HeapFree(GetProcessHeap(), 0, dst);
+                        }
+                    }
+                }
+                SafeRuntimeInvoke(mda_dispose->method_info, boxed_mda, nullptr, nullptr, &cf);
+            }
         }
 
         // 每个部件用一个全新烘焙 Mesh（不复用），从根上杜绝上一部件数据残留串味。
@@ -574,16 +663,16 @@ void ExportVertexProbe() {
             }
             if (bh) g_host->gchandle_free(g_host->context, bh);
         }
-        rows.push_back(Row{ parts[pi].name, svc, slen, blen, readable, visible });
+        rows.push_back(Row{ parts[pi].name, svc, slen, blen, mdvc, readable, visible, mdok });
     }
 
-    int shared_nonempty = 0, baked_nonempty = 0;
-    for (auto& rw : rows) { if (rw.slen > 0) ++shared_nonempty; if (rw.blen > 0) ++baked_nonempty; }
+    int shared_nonempty = 0, baked_nonempty = 0, md_nonempty = 0;
+    for (auto& rw : rows) { if (rw.slen > 0) ++shared_nonempty; if (rw.blen > 0) ++baked_nonempty; if (rw.mdok) ++md_nonempty; }
     {
         char fm[300];
         std::snprintf(fm, sizeof(fm),
-            "vertex-probe: parts=%d sharedNonEmpty=%d bakedNonEmpty=%d sample='%s' verts=%d fail=%d %lu ms",
-            static_cast<int>(rows.size()), shared_nonempty, baked_nonempty,
+            "vertex-probe: parts=%d sharedNonEmpty=%d bakedNonEmpty=%d meshDataNonEmpty=%d sample='%s' verts=%d fail=%d %lu ms",
+            static_cast<int>(rows.size()), shared_nonempty, baked_nonempty, md_nonempty,
             sample_name.c_str(), static_cast<int>(spts.size()), sfail,
             static_cast<unsigned long>(GetTickCount() - t0));
         Log(fm);
@@ -604,15 +693,15 @@ void ExportVertexProbe() {
         Log("vertex-probe: open output file fail.");
         return;
     }
-    fwprintf(file, L"Chen vertex probe v0.6.0 (per-part fresh BakeMesh)\nparts: %d\n",
+    fwprintf(file, L"Chen vertex probe v0.7.0 (MeshData direct + BakeMesh cross-check)\nparts: %d\n",
         static_cast<int>(rows.size()));
-    fwprintf(file, L"%-40ls %7s %7s %8s %9s %7s\n", L"part", L"shr_vc", L"shr_len", L"bake_len", L"readabl", L"visible");
+    fwprintf(file, L"%-40ls %7s %7s %8s %7s %6s %9s %7s\n", L"part", L"shr_vc", L"shr_len", L"bake_len", L"md_vc", L"md_ok", L"readabl", L"visible");
     for (auto& rw : rows) {
         const std::wstring wn = Utf8ToWide(rw.name);
-        fwprintf(file, L"%-40ls %7d %7d %8d %9s %7s\n", wn.c_str(), rw.svc, rw.slen, rw.blen,
-            rw.readable ? L"true" : L"false", rw.visible ? L"true" : L"false");
+        fwprintf(file, L"%-40ls %7d %7d %8d %7d %6s %9s %7s\n", wn.c_str(), rw.svc, rw.slen, rw.blen, rw.mdvc,
+            rw.mdok ? L"true" : L"false", rw.readable ? L"true" : L"false", rw.visible ? L"true" : L"false");
     }
-    fwprintf(file, L"\nsampled baked part: %ls\n", Utf8ToWide(sample_name).c_str());
+    fwprintf(file, L"\nsampled part (MeshData preferred, else BakeMesh): %ls\n", Utf8ToWide(sample_name).c_str());
     fwprintf(file, L"baked vertexCount: %d, read verts: %d, failed: %d\n",
         sbvc, static_cast<int>(spts.size()), sfail);
     fwprintf(file, L"AABB min: %.5f %.5f %.5f\nAABB max: %.5f %.5f %.5f\nsize: %.5f %.5f %.5f\n",
@@ -651,10 +740,9 @@ bool GameWindowHasFocus() {
 void InputThreadMain() {
     bool was_down = false;
     while (!g_input_stop.load(std::memory_order_acquire)) {
-        // 组合热键 Ctrl+Shift+E（E=Export 导出）。游戏单键 F 区(F9抽卡/F10简报等)被占用，
-        // 三键组合游戏不会绑定，既不撞车也不会误触；边沿触发逻辑在下面保证按住只导出一次。
-        const bool down = GameWindowHasFocus() && IsKeyDown(VK_CONTROL) &&
-                          IsKeyDown(VK_SHIFT) && IsKeyDown('E');
+        // 组合热键 Ctrl+E（E=Export 导出）。不用 Shift：Shift 是游戏冲刺键，三键同按会让角色迈步，
+        // 也不利于以后多角色横列站定抓拍；Ctrl+E 游戏未绑定。边沿触发保证按住只导出一次。
+        const bool down = GameWindowHasFocus() && IsKeyDown(VK_CONTROL) && IsKeyDown('E');
         if (down && !was_down) {
             g_export_request.store(true, std::memory_order_release);
         }
@@ -745,6 +833,16 @@ BE_Result BE_CALL Initialize(const BE_HostApiV1* host) {
         Log("Could not resolve UnityEngine.Mesh class.");
     }
 
+    // v0.7.0：解析嵌套类 UnityEngine.Mesh.MeshDataArray（点号外层.内层，供 object_new 装箱）。
+    BE_ResolvedClassV1 mda_class{};
+    if (host->resolve_class(host->context, "UnityEngine.CoreModule.dll",
+            "UnityEngine", "Mesh.MeshDataArray", &mda_class) == BE_Result_Ok && mda_class.class_info) {
+        g_mda_class_info = const_cast<void*>(mda_class.class_info);
+        Log("Resolved support class: UnityEngine.Mesh.MeshDataArray");
+    } else {
+        Log("Could not resolve UnityEngine.Mesh.MeshDataArray nested class (MeshData direct channel disabled).");
+    }
+
     MethodContract* pump = Contract("pump");
     if (!pump || !pump->resolved) {
         Log("Main-thread pump contract missing; exporter cannot run.");
@@ -759,7 +857,7 @@ BE_Result BE_CALL Initialize(const BE_HostApiV1* host) {
 
     g_input_stop.store(false, std::memory_order_release);
     g_input_thread = std::thread(InputThreadMain);
-    Log("Scene Exporter v0.6.0 ready (Cameras + SkinnedMesh + per-part BakeMesh vertex probe). Focus the game and press Ctrl+Shift+E.");
+    Log("Scene Exporter v0.7.0 ready (Cameras + SkinnedMesh + MeshData direct vertex channel + BakeMesh cross-check). Focus the game and press Ctrl+E.");
     return BE_Result_Ok;
 }
 
@@ -789,7 +887,7 @@ void BE_CALL Shutdown() {
 }
 
 const BE_ModuleApiV1 kApi{
-    {kModuleId, "Scene Exporter", "0.6.0", BETTER_ENDFIELD_MODULE_ABI_V1},
+    {kModuleId, "Scene Exporter", "0.7.0", BETTER_ENDFIELD_MODULE_ABI_V1},
     &Initialize, &ConfigurationChanged, &Shutdown};
 
 } // namespace
