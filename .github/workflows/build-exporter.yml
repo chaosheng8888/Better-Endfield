@@ -1,9 +1,6 @@
 name: Build Scene Exporter
 
-# 云端编译：每次 native 目录或本文件变更时自动编译；也可在 Actions 页手动 Run workflow。
-# windows-latest 自带 Visual Studio 2022 C++ 工具集与 CMake，无需自己装编译器。
-# 只编译 Exporter 这一个目标，绕开 UI/dotnet/语音清单等前置，最快拿到 dll。
-on:
+# 浜戠缂栬瘧锛氭瘡娆?native 鐩綍鎴栨湰鏂囦欢鍙樻洿鏃惰嚜鍔ㄧ紪璇戯紱涔熷彲鍦?Actions 椤垫墜鍔?Run workflow銆?# 鍥哄畾 windows-2022 闀滃儚锛氬畠纭畾鑷甫 Visual Studio 2022锛圡SVC v143 C++锛夈€乄indows SDK 涓?CMake銆?# 涓嶇敤 windows-latest锛氭渶鏂伴暅鍍忓凡鍗囩骇锛屼笉鍐嶅唴缃?VS2022锛屼細鎶?"could not find any instance of Visual Studio"銆?# 鍙紪璇?Exporter 杩欎竴涓洰鏍囷紝缁曞紑 UI/dotnet/璇煶娓呭崟绛夊墠缃紝鏈€蹇嬁鍒?dll銆?on:
   push:
     paths:
       - 'native/**'
@@ -12,10 +9,17 @@ on:
 
 jobs:
   build-windows:
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Show toolchain (cmake version + installed Visual Studio)
+        shell: pwsh
+        run: |
+          cmake --version
+          $vswhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path $vswhere) { & $vswhere -all -products * } else { Write-Warning "vswhere not found" }
 
       - name: Configure (Visual Studio 2022, x64)
         run: cmake -S native -B build -G "Visual Studio 17 2022" -A x64
