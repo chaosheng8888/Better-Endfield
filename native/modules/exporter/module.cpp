@@ -659,7 +659,7 @@ void ExportVertexProbe() {
                         }
                     }
                 }
-                SafeRuntimeInvoke(mda_dispose->method_info, boxed_mda, nullptr, nullptr, &cf);
+                SafeRuntimeInvoke(mda_dispose->method_info, boxed_mda, nullptr, nullptr, &af);
             }
         }
 
