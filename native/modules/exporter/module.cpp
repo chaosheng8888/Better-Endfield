@@ -50,11 +50,11 @@ MethodContract g_contracts[]{
             "get_name", nullptr, "System.String", 0}},
     // 数组长度：Array.GetLength(int dimension) -> int。
     {"array.get_length",
-        {"mscorlib", "System", "Array",
+        {"mscorlib.dll", "System", "Array",
             "GetLength", "System.Int32", "System.Int32", 1}},
     // 数组取元素：Array.GetValue(int index) -> object。
     {"array.get_value",
-        {"mscorlib", "System", "Array",
+        {"mscorlib.dll", "System", "Array",
             "GetValue", "System.Int32", "System.Object", 1}},
 };
 
