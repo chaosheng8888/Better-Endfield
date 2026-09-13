@@ -1,4 +1,4 @@
-// BetterEndfield Scene Exporter — v0.7.0 (S4-2: add Mesh.MeshDataArray read-only direct channel
+// BetterEndfield Scene Exporter — v0.7.1 (S4-2: Mesh.MeshDataArray read-only direct channel
 // CopyAttributeIntoPtr with checkReadWrite=false to bypass isReadable=false GPU-resident meshes;
 // keep per-part BakeMesh as cross-check; hotkey Ctrl+E).
 //
@@ -96,9 +96,10 @@ MethodContract g_contracts[]{
             "get_isVisible", nullptr, "System.Boolean", 0}},
     // v0.7.0 MeshData 只读直读通道（绕开 isReadable=false）。嵌套类用“外层.内层”点号写法。
     // MeshDataArray..ctor(Mesh mesh, bool checkReadWrite)：checkReadWrite=false 跳过可读标志检查。
+    // ★多参数类型串必须用竖线 | 分隔（host 的 SplitParameters 只认 |；写逗号会被整段当成一个参数而匹配失败）。
     {"mda.ctor",
         {"UnityEngine.CoreModule.dll", "UnityEngine", "Mesh.MeshDataArray",
-            ".ctor", "UnityEngine.Mesh,System.Boolean", "System.Void", 2}},
+            ".ctor", "UnityEngine.Mesh|System.Boolean", "System.Void", 2}},
     // MeshDataArray.Dispose()：读完必须释放对原生顶点缓冲的锁定。
     {"mda.dispose",
         {"UnityEngine.CoreModule.dll", "UnityEngine", "Mesh.MeshDataArray",
@@ -112,7 +113,7 @@ MethodContract g_contracts[]{
     {"md.copy_pos",
         {"UnityEngine.CoreModule.dll", "UnityEngine", "Mesh.MeshData",
             "CopyAttributeIntoPtr",
-            "System.IntPtr,UnityEngine.Rendering.VertexAttribute,UnityEngine.Rendering.VertexAttributeFormat,System.Int32,System.IntPtr",
+            "System.IntPtr|UnityEngine.Rendering.VertexAttribute|UnityEngine.Rendering.VertexAttributeFormat|System.Int32|System.IntPtr",
             "System.Void", 5}},
 };
 
@@ -693,7 +694,7 @@ void ExportVertexProbe() {
         Log("vertex-probe: open output file fail.");
         return;
     }
-    fwprintf(file, L"Chen vertex probe v0.7.0 (MeshData direct + BakeMesh cross-check)\nparts: %d\n",
+    fwprintf(file, L"Chen vertex probe v0.7.1 (MeshData direct + BakeMesh cross-check)\nparts: %d\n",
         static_cast<int>(rows.size()));
     fwprintf(file, L"%-40ls %7s %7s %8s %7s %6s %9s %7s\n", L"part", L"shr_vc", L"shr_len", L"bake_len", L"md_vc", L"md_ok", L"readabl", L"visible");
     for (auto& rw : rows) {
@@ -857,7 +858,7 @@ BE_Result BE_CALL Initialize(const BE_HostApiV1* host) {
 
     g_input_stop.store(false, std::memory_order_release);
     g_input_thread = std::thread(InputThreadMain);
-    Log("Scene Exporter v0.7.0 ready (Cameras + SkinnedMesh + MeshData direct vertex channel + BakeMesh cross-check). Focus the game and press Ctrl+E.");
+    Log("Scene Exporter v0.7.1 ready (Cameras + SkinnedMesh + MeshData direct vertex channel + BakeMesh cross-check). Focus the game and press Ctrl+E.");
     return BE_Result_Ok;
 }
 
@@ -887,7 +888,7 @@ void BE_CALL Shutdown() {
 }
 
 const BE_ModuleApiV1 kApi{
-    {kModuleId, "Scene Exporter", "0.7.0", BETTER_ENDFIELD_MODULE_ABI_V1},
+    {kModuleId, "Scene Exporter", "0.7.1", BETTER_ENDFIELD_MODULE_ABI_V1},
     &Initialize, &ConfigurationChanged, &Shutdown};
 
 } // namespace
