@@ -112,6 +112,16 @@ set_target_properties(BetterEndfield.Gacha PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${BETTER_ENDFIELD_STAGE_DIR}/modules"
 )
 
+add_library(BetterEndfield.Exporter SHARED
+    modules/exporter/module.cpp
+)
+better_endfield_target_defaults(BetterEndfield.Exporter)
+set_target_properties(BetterEndfield.Exporter PROPERTIES
+    OUTPUT_NAME "BetterEndfield.Exporter"
+    RUNTIME_OUTPUT_DIRECTORY "${BETTER_ENDFIELD_STAGE_DIR}/modules"
+    LIBRARY_OUTPUT_DIRECTORY "${BETTER_ENDFIELD_STAGE_DIR}/modules"
+)
+
 add_library(BetterEndfield.CombatStats SHARED
     modules/combat_stats/module.cpp
     modules/combat_stats/combat_semantics.cpp
@@ -280,6 +290,9 @@ add_custom_target(BetterEndfield.Layout ALL
         "${CMAKE_CURRENT_SOURCE_DIR}/modules/gacha/betterendfield.gacha.module.ini"
         "${BETTER_ENDFIELD_STAGE_DIR}/modules/betterendfield.gacha.module.ini"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/modules/exporter/betterendfield.exporter.module.ini"
+        "${BETTER_ENDFIELD_STAGE_DIR}/modules/betterendfield.exporter.module.ini"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/../manifests/combat/combat-semantics.besem"
         "${BETTER_ENDFIELD_STAGE_DIR}/modules/combat-semantics.besem"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -293,6 +306,7 @@ add_custom_target(BetterEndfield.Layout ALL
         BetterEndfield.UiModule
         BetterEndfield.Camera
         BetterEndfield.Gacha
+        BetterEndfield.Exporter
         BetterEndfield.CombatStats
         BetterEndfield.CombatOverlay
         BetterEndfield.Injector
