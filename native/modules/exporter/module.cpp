@@ -1,4 +1,8 @@
-// BetterEndfield Scene Exporter — v0.9.1 (read-only bind-pose static mesh vertex readback: Mesh.GetVertexBuffer(0) -> Graphics.CopyBuffer into our CopySource|CopyDestination staging GraphicsBuffer -> AsyncGPUReadback; no game buffer target is mutated; see TickGpuVertexReadback):
+// BetterEndfield Scene Exporter — v0.9.2 (full raw-material capture for offline glTF assembly:
+// read-only static bind-pose vertex streams 0 (pos/norm/tan) and 1 (uv) via Mesh.GetVertexBuffer ->
+// Graphics.CopyBuffer into our CopySource|CopyDestination staging -> AsyncGPUReadback, PLUS CPU-side
+// triangle indices / bindposes / classic 4-bone weights / ordered bone names; every part is dumped to
+// scene-export/chen_raw_<tick>/; no game buffer target is ever mutated; see TickGpuVertexReadback):
 // *** NEVER call set_vertexBufferTarget on game meshes/renderers *** — v0.7.4~v0.7.8 did, and it
 // tore down+rebuilt GPU-resident vertex buffers with no CPU copy, so hair/body/clothes vanished
 // on screen right after Ctrl+E (only CPU-backed face/eyebrow/cloth_03 survived). Confirmed by user:
@@ -196,6 +200,31 @@ MethodContract g_contracts[]{
     {"graphics.copy_buffer",
         {"UnityEngine.CoreModule.dll", "UnityEngine", "Graphics",
             "CopyBuffer", "UnityEngine.GraphicsBuffer|UnityEngine.GraphicsBuffer", "System.Void", 2}},
+    // ===== v0.9.2 full-raw-material capture (geometry + skinning). None of these are in the
+    // mandatory-ready gate: if a CPU accessor is empty for a GPU-resident mesh, that item is simply
+    // left empty and logged, never blocking the proven stream0/1 vertex readback main chain.
+    // Mesh.subMeshCount getter -> int (number of separate triangle index lists).
+    {"mesh.submesh_count",
+        {"UnityEngine.CoreModule.dll", "UnityEngine", "Mesh",
+            "get_subMeshCount", nullptr, "System.Int32", 0}},
+    // Mesh.GetIndices(int submesh, bool applyBaseVertex=false) -> int[] . The 2-arg overload is
+    // uniquely selected by the Int32|Boolean signature; return type left null (name+arity unique).
+    {"mesh.get_indices",
+        {"UnityEngine.CoreModule.dll", "UnityEngine", "Mesh",
+            "GetIndices", "System.Int32|System.Boolean", nullptr, 2}},
+    // Mesh.bindposes getter -> Matrix4x4[] (inverse-bind, column-major, 64B/bone). 0-arg unique.
+    {"mesh.bindposes",
+        {"UnityEngine.CoreModule.dll", "UnityEngine", "Mesh",
+            "get_bindposes", nullptr, nullptr, 0}},
+    // Mesh.GetBoneWeightsImpl() -> BoneWeight[] classic 4-weight (past header 32B/vertex:
+    // 4 float weights then 4 int bone indices). 0-arg unique, return type left null.
+    {"mesh.bone_weights",
+        {"UnityEngine.CoreModule.dll", "UnityEngine", "Mesh",
+            "GetBoneWeightsImpl", nullptr, nullptr, 0}},
+    // SkinnedMeshRenderer.bones getter -> Transform[] (skeleton nodes; names read in array order).
+    {"skinned.get_bones",
+        {"UnityEngine.CoreModule.dll", "UnityEngine", "SkinnedMeshRenderer",
+            "get_bones", nullptr, nullptr, 0}},
     {"sysinfo.devtype",
         {"UnityEngine.CoreModule.dll", "UnityEngine", "SystemInfo",
             "GetGraphicsDeviceType", nullptr, nullptr, 0}},
@@ -611,6 +640,10 @@ struct GpuPartResult {
     int32_t m_finite = 0;                               // finite bind-pose positions decoded
     BE_Vec3 mmn{0,0,0}, mmx{0,0,0};                     // bind-pose Position AABB
     std::string mraw;                                   // first bytes of the relayed static buffer
+    // v0.9.2 full-raw-material capture diagnostics
+    int32_t s_count[3] = {-1,-1,-1}, s_stride[3] = {-1,-1,-1};
+    int32_t submesh_count = -1, idx_count = 0, bind_bones = 0, bw_verts = 0, bones_n = 0;
+    bool idx_got = false, bind_got = false, bw_got = false, bones_got = false;
 };
 
 // v0.7.8 device identity, filled once at start.
@@ -624,13 +657,27 @@ struct GpuPart {
     std::string name;
     int32_t expect_vc = 0;
     bool collected = false;
-    int miss = 0; // v0.7.8 consecutive frames its lod0 GPU buffer was absent (SEH/empty)
-    // v0.7.8 stream0 async readback cross-frame state
-    bool requested = false;
-    uint32_t b0gb_root = 0;     void* b0gb = nullptr;
-    uint32_t req_root = 0;      void* req_boxed = nullptr;
-    uint32_t msrc_root = 0;     void* m_src = nullptr;    // v0.9.0 pinned static source GraphicsBuffer
-    uint32_t mstage_root = 0;   void* m_stage = nullptr;  // v0.9.0 our staging buffer (Release() after)
+    int miss = 0; // consecutive frames its lod0 GPU buffer was absent (SEH/empty)
+    bool requested = false; // phase-1 dispatch done exactly once
+    // v0.9.2 per-stream GPU readback. stream0 = Position/Normal/Tangent (proven in v0.9.1),
+    // stream1 = TexCoord0/2. stream2 is NOT read on the GPU: skinning weights/joints come from
+    // the CPU GetBoneWeightsImpl accessor instead (more robust, already in bind order).
+    struct StreamReq {
+        bool dispatched = false, done = false, err = false;
+        void* src = nullptr;    uint32_t src_root = 0;
+        void* stage = nullptr;  uint32_t stage_root = 0;
+        void* req = nullptr;    uint32_t req_root = 0;
+        int32_t count = -1, stride = -1;
+        std::vector<uint8_t> bytes;
+    };
+    StreamReq sr[3];
+    int nstreams = 1;
+    // v0.9.2 CPU-side captures (filled synchronously in phase 1).
+    std::vector<int32_t> indices;        // all submeshes' indices concatenated
+    std::vector<int32_t> sub_idxcount;   // index count per submesh (matches the concatenation)
+    std::vector<uint8_t> bindposes;      // Matrix4x4[] raw, 64B/bone, column-major
+    std::vector<uint8_t> boneweights;    // BoneWeight[] raw, 32B/vertex (4 float w + 4 int idx)
+    std::string bones_names;             // SMR.bones Transform names in order, one per line
     GpuPartResult pr;
 };
 
@@ -743,36 +790,55 @@ void StartGpuVertexReadback() {
     g_gpu_wait = 0; g_gpu_start_tick = GetTickCount();
     g_gpu_phase.store(1, std::memory_order_release);
     char m[220]; std::snprintf(m, sizeof(m),
-        "gpu-probe START v0.9.1: %d Chen lod0 parts; READ-ONLY path M = Mesh.GetVertexBuffer(0) static bind-pose buffer -> Graphics.CopyBuffer into our staging -> AsyncGPUReadback; path A (SMR current-frame) recorded as control only.",
+        "gpu-probe START v0.9.2: %d Chen lod0 parts; READ-ONLY GPU relay of vertex streams 0/1 (static bind-pose buffers) + CPU indices/bindposes/boneWeights/bones; materials dumped to chen_raw_<tick>; SMR current-frame is control only.",
         (int)g_gpu_parts.size()); Log(m);
 }
 
-// v0.7.9 collector. Path A = SMR current-frame already-skinned GPU buffer (read-only). Stream note:
-// Position/Normal/Tangent and is enough to prove the full shape reads back, so this version
-// fully reads stream 0 via AsyncGPUReadback (cross-frame: dispatch on first visit, poll on
-// later visits) while still recording the A/B1/B2 diagnostics. Returns 0 = try next frame.
+// IL2CPP single-dim zero-based array memory layout: [object header 0x10][bounds* 0x8][length 0x8]
+// then tightly-packed elements at +0x20. POD-only body so __try is legal. Caller passes a validated
+// element count and a resized destination.
+bool SafeReadManagedArray(void* arr, int32_t count, size_t elem_size, void* dst) {
+    if (!arr || !dst || count <= 0 || elem_size == 0) return false;
+    __try {
+        const uint8_t* base = reinterpret_cast<const uint8_t*>(arr) + 0x20;
+        std::memcpy(dst, base, (size_t)count * elem_size);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// v0.9.2 collector. GPU-reads the static bind-pose vertex streams 0 (Position/Normal/Tangent) and
+// 1 (TexCoord) via the proven Graphics.CopyBuffer -> AsyncGPUReadback relay (no game target mutated),
+// and synchronously captures CPU-side material: triangle indices, bindposes, classic 4-bone weights,
+// and the ordered bone names. Returns 0 = not ready, poll on a later frame; 1 = this part is done.
 int CollectOnePart(GpuPart& gp) {
     MethodContract* get_vb = Contract("skinned.get_vb");
     MethodContract* gb_count = Contract("gb.get_count");
     MethodContract* gb_stride = Contract("gb.get_stride");
-    MethodContract* gb_target = Contract("gb.get_target");
     MethodContract* attr_count = Contract("mesh.attr_count");
     MethodContract* get_attr = Contract("mesh.get_attr");
     MethodContract* request = Contract("gpuread.request");
     MethodContract* isdone = Contract("gpr.is_done");
     MethodContract* haserr = Contract("gpr.has_error");
     MethodContract* getraw = Contract("gpr.get_data_raw");
+    MethodContract* get_length = Contract("array.get_length");
+    MethodContract* get_value = Contract("array.get_value");
+    MethodContract* get_name = Contract("object.get_name");
     GpuPartResult& R = gp.pr;
     R.name = gp.name; R.expect_vc = gp.expect_vc;
 
-    auto GbDesc = [&](void* gb, int32_t& c, int32_t& st, int32_t& tg) {
+    auto GbDesc = [&](void* gb, int32_t& c, int32_t& st) {
         c = UnboxInt(Invoke(gb_count, gb, nullptr));
         st = UnboxInt(Invoke(gb_stride, gb, nullptr));
-        if (gb_target && gb_target->resolved) tg = UnboxInt(Invoke(gb_target, gb, nullptr));
     };
 
-    // ---------- phase 1 (once): layout + A/B descriptions + dispatch stream0 request ----------
+    // ---------- phase 1 (once): layout + CPU captures + dispatch per-stream GPU requests ----------
     if (!gp.requested) {
+        // reset CPU captures (phase 1 may run more than once if a static buffer shows up late)
+        gp.indices.clear(); gp.sub_idxcount.clear(); gp.bindposes.clear();
+        gp.boneweights.clear(); gp.bones_names.clear();
+        R.idx_count = 0; R.bind_bones = 0; R.bw_verts = 0; R.bones_n = 0;
+        R.idx_got = R.bind_got = R.bw_got = R.bones_got = false;
+
         const int32_t nac = UnboxInt(Invoke(attr_count, gp.mesh, nullptr));
         int maxStream = -1; char lay[320]{};
         if (nac > 0 && nac < 32) {
@@ -788,141 +854,194 @@ int CollectOnePart(GpuPart& gp) {
             }
         }
         R.layout = lay;
-        R.n_stream = maxStream + 1; if (R.n_stream < 1) R.n_stream = 1; if (R.n_stream > 3) R.n_stream = 3;
+        int ns = maxStream + 1; if (ns < 1) ns = 1; if (ns > 2) ns = 2; // GPU-read streams 0 and 1 only
+        gp.nstreams = ns;
 
-        // PATH A (control only): SMR current-frame skinned buffer. Just record whether it exists; do NOT
-        // read it (Vulkan GPU-skinning leaves it null for the 8 big parts even after set_vertexBufferTarget).
+        // PATH A control diagnostic: SMR current-frame buffer descriptor only, bytes never read.
         void* agb = Invoke(get_vb, gp.renderer, nullptr);
-        if (agb) { R.a_got = true; GbDesc(agb, R.a_count, R.a_stride, R.a_target); }
+        if (agb) { R.a_got = true; GbDesc(agb, R.a_count, R.a_stride); }
 
-        // PATH M (route under test): Mesh.GetVertexBuffer(0) = bind-pose STATIC GPU buffer, persistent
-        // since load. It is Vertex-only (target=1), which AsyncGPUReadback rejects directly, so we build our
-        // OWN staging GraphicsBuffer (CopySource|CopyDestination) and Graphics.CopyBuffer the static bytes
-        // into it on the GPU, then async-read the staging buffer. No game buffer target is ever changed.
+        // ----- v0.9.2 CPU captures (each independently optional; a miss is never fatal) -----
+        // (a) triangle indices, concatenated per submesh
+        MethodContract* c_sub = Contract("mesh.submesh_count");
+        MethodContract* c_idx = Contract("mesh.get_indices");
+        if (c_sub && c_sub->resolved) {
+            R.submesh_count = UnboxInt(Invoke(c_sub, gp.mesh, nullptr));
+            if (R.submesh_count > 0 && R.submesh_count < 32 && c_idx && c_idx->resolved) {
+                bool any = false;
+                for (int32_t s = 0; s < R.submesh_count; ++s) {
+                    int32_t sub = s; bool applyBase = false;
+                    void* ip[2]{ &sub, &applyBase };
+                    void* iarr = Invoke(c_idx, gp.mesh, ip);
+                    const int32_t ilen = ArrayLengthOf(get_length, iarr);
+                    if (ilen <= 0 || ilen > 5000000) { gp.sub_idxcount.push_back(0); continue; }
+                    size_t oldn = gp.indices.size();
+                    gp.indices.resize(oldn + ilen);
+                    if (SafeReadManagedArray(iarr, ilen, 4, gp.indices.data() + oldn)) {
+                        gp.sub_idxcount.push_back(ilen); R.idx_count += ilen; any = true;
+                    } else { gp.indices.resize(oldn); gp.sub_idxcount.push_back(0); }
+                }
+                R.idx_got = any;
+            }
+        }
+        // (b) bindposes: Matrix4x4[] (64B/bone, Unity column-major == glTF column-major)
+        MethodContract* c_bind = Contract("mesh.bindposes");
+        if (c_bind && c_bind->resolved) {
+            void* barr = Invoke(c_bind, gp.mesh, nullptr);
+            const int32_t blen = ArrayLengthOf(get_length, barr);
+            if (blen > 0 && blen < 65536) {
+                gp.bindposes.resize((size_t)blen * 64);
+                if (SafeReadManagedArray(barr, blen, 64, gp.bindposes.data())) { R.bind_bones = blen; R.bind_got = true; }
+                else gp.bindposes.clear();
+            }
+        }
+        // (c) classic 4-bone weights: BoneWeight[] (32B/vertex = 4 float weights + 4 int indices)
+        MethodContract* c_bw = Contract("mesh.bone_weights");
+        if (c_bw && c_bw->resolved) {
+            void* warr = Invoke(c_bw, gp.mesh, nullptr);
+            const int32_t wlen = ArrayLengthOf(get_length, warr);
+            if (wlen > 0 && wlen < 5000000) {
+                gp.boneweights.resize((size_t)wlen * 32);
+                if (SafeReadManagedArray(warr, wlen, 32, gp.boneweights.data())) { R.bw_verts = wlen; R.bw_got = true; }
+                else gp.boneweights.clear();
+            }
+        }
+        // (d) SMR.bones: ordered Transform names (skeleton node order matches bindposes/weight indices)
+        MethodContract* c_bones = Contract("skinned.get_bones");
+        if (c_bones && c_bones->resolved && get_value && get_value->resolved && get_name && get_name->resolved) {
+            void* tarr = Invoke(c_bones, gp.renderer, nullptr);
+            const int32_t tlen = ArrayLengthOf(get_length, tarr);
+            if (tlen > 0 && tlen < 65536) {
+                R.bones_n = tlen; R.bones_got = true;
+                for (int32_t bi = 0; bi < tlen; ++bi) {
+                    int32_t bix = bi; void* bp[1]{ &bix };
+                    void* tr = Invoke(get_value, tarr, bp);
+                    char bn[160]{}; bool bf = false;
+                    SafeCopyName(Invoke(get_name, tr, nullptr), bn, sizeof(bn), &bf);
+                    char line[192]; std::snprintf(line, sizeof(line), "%d %s\n", bi, bn);
+                    gp.bones_names += line;
+                }
+            }
+        }
+
+        // ----- GPU per-stream relay. Pass 1: acquire every source + descriptor first (no allocation
+        // yet), so a late/missing source retries next frame without leaking staging buffers. -----
         MethodContract* mget = Contract("mesh.get_vb_stream");
         MethodContract* gbctor = Contract("gb.ctor");
-        MethodContract* gbrel = Contract("gb.release");
         MethodContract* copyb = Contract("graphics.copy_buffer");
         if (!mget || !mget->resolved || !gbctor || !gbctor->resolved || !g_gb_class_info ||
             !copyb || !copyb->resolved || !request || !request->resolved) {
             R.req_error = true; Log("gpu-probe: path M contracts/class not ready."); return 1;
         }
-        int32_t stream0 = 0; void* sp0[1]{ &stream0 };
-        void* src = Invoke(mget, gp.mesh, sp0);
-        if (!src) { ++gp.miss; return 0; } // static buffer momentarily unavailable -> retry next frames
-        R.m_src_got = true;
-        GbDesc(src, R.m_count, R.m_stride, R.m_target);
-        if (R.m_count <= 0 || R.m_stride <= 0 || R.m_stride > 1024) {
-            char w[200]; std::snprintf(w, sizeof(w), "gpu-probe[%s] path M bad static desc c=%d st=%d.",
-                gp.name.c_str(), R.m_count, R.m_stride); Log(w); return 1;
+        void* srcs[3]{ nullptr, nullptr, nullptr };
+        int32_t sc[3]{ -1,-1,-1 }, sst[3]{ -1,-1,-1 };
+        for (int s = 0; s < ns; ++s) {
+            int32_t si = s; void* spx[1]{ &si };
+            void* src = Invoke(mget, gp.mesh, spx);
+            int32_t c = -1, st = -1;
+            if (src) GbDesc(src, c, st);
+            if (!src || c <= 0 || st <= 0 || st > 1024) { ++gp.miss; return 0; } // retry whole phase next frame
+            srcs[s] = src; sc[s] = c; sst[s] = st;
         }
-        // Construct the staging buffer: CopySource(4)|CopyDestination(8)=12, same count/stride as source.
-        void* stage = g_host->object_new(g_host->context, g_gb_class_info);
-        if (!stage) { R.req_error = true; Log("gpu-probe: object_new GraphicsBuffer failed."); return 1; }
-        { int32_t usage = 12, cnt = R.m_count, sst = R.m_stride; void* cp[3]{ &usage, &cnt, &sst };
-          Invoke(gbctor, stage, cp); }
-        { void* cpar[2]{ src, stage }; Invoke(copyb, nullptr, cpar); } // GPU-side src -> stage
-        R.m_stage_built = true; R.m_copy_ok = true;
-        { void* rq[2]{ stage, nullptr }; void* boxed = Invoke(request, nullptr, rq);
-          if (!boxed) {
-              R.m_req_haserr = true;
-              if (gbrel && gbrel->resolved) Invoke(gbrel, stage, nullptr);
-              Log("gpu-probe: path M staging Request returned null."); return 1;
-          }
-          gp.m_src = src; gp.m_stage = stage; gp.req_boxed = boxed;
-          gp.msrc_root = g_host->gchandle_new(g_host->context, src, 0);
-          gp.mstage_root = g_host->gchandle_new(g_host->context, stage, 0);
-          gp.req_root = g_host->gchandle_new(g_host->context, boxed, 0);
+        // Pass 2: all sources present -> build a staging buffer per stream, CopyBuffer on GPU, request.
+        for (int s = 0; s < ns; ++s) {
+            void* stage = g_host->object_new(g_host->context, g_gb_class_info);
+            if (!stage) { R.req_error = true; return 1; }
+            { int32_t usage = 12, cnt = sc[s], sstr = sst[s]; void* cp[3]{ &usage, &cnt, &sstr };
+              Invoke(gbctor, stage, cp); }
+            { void* cpar[2]{ srcs[s], stage }; Invoke(copyb, nullptr, cpar); }
+            void* rq[2]{ stage, nullptr }; void* boxed = Invoke(request, nullptr, rq);
+            if (!boxed) { MethodContract* rel = Contract("gb.release");
+                if (rel && rel->resolved) Invoke(rel, stage, nullptr);
+                gp.sr[s].err = true; continue; }
+            gp.sr[s].src = srcs[s]; gp.sr[s].stage = stage; gp.sr[s].req = boxed;
+            gp.sr[s].count = sc[s]; gp.sr[s].stride = sst[s]; gp.sr[s].dispatched = true;
+            gp.sr[s].src_root = g_host->gchandle_new(g_host->context, srcs[s], 0);
+            gp.sr[s].stage_root = g_host->gchandle_new(g_host->context, stage, 0);
+            gp.sr[s].req_root = g_host->gchandle_new(g_host->context, boxed, 0);
+            R.s_count[s] = sc[s]; R.s_stride[s] = sst[s];
         }
         gp.requested = true;
-        char sb[280]; std::snprintf(sb, sizeof(sb),
-            "gpu-probe[%s] pathM static c=%d st=%d tg=%d readable=%d (control A got=%d); CopyBuffer+request sent.",
-            gp.name.c_str(), R.m_count, R.m_stride, R.m_target, R.m_readable, (int)R.a_got); Log(sb);
-        return 0; // let the GPU readback finish over the next frames
+        char sb[320]; std::snprintf(sb, sizeof(sb),
+            "gpu-probe[%s] v0.9.2 dispatched %d vertex stream(s) c0=%d st0=%d; CPU idx=%d (%d sub) bind=%d bw=%d bones=%d readable=%d Actrl=%d",
+            gp.name.c_str(), ns, R.s_count[0], R.s_stride[0], R.idx_count, R.submesh_count,
+            R.bind_bones, R.bw_verts, R.bones_n, R.m_readable, (int)R.a_got); Log(sb);
+        return 0; // let the GPU readbacks finish across the next frames
     }
 
-    // ---------- phase 2: poll the M-path request, copy bytes, decode bind-pose Position ----------
-    void* req = UnboxThis(gp.req_boxed);
-    if (!req) { R.req_error = true; return 1; }
-    void* sp[1]{ req };
-    bool done = false, ef = false;
-    if (!SafeUnbox(Invoke(isdone, nullptr, sp), &done, sizeof(done), &ef) || ef) return 0; // poll again
-    if (!done) return 0;
-    bool herr = false;
-    if (SafeUnbox(Invoke(haserr, nullptr, sp), &herr, sizeof(herr), &ef) && !ef && herr) {
-        R.m_req_haserr = true; Log("gpu-probe: path M staging readback HasError."); return 1;
+    // ---------- phase 2: poll every stream, then copy its full raw bytes ----------
+    bool all_done = true;
+    for (int s = 0; s < gp.nstreams; ++s) {
+        auto& z = gp.sr[s];
+        if (!z.dispatched) { all_done = false; continue; }
+        if (z.done || z.err) continue;
+        void* req = UnboxThis(z.req);
+        if (!req) { z.err = true; continue; }
+        void* sp[1]{ req };
+        bool done = false, ef = false;
+        if (!SafeUnbox(Invoke(isdone, nullptr, sp), &done, sizeof(done), &ef) || ef) { all_done = false; continue; }
+        if (!done) { all_done = false; continue; }
+        bool herr = false;
+        if (SafeUnbox(Invoke(haserr, nullptr, sp), &herr, sizeof(herr), &ef) && !ef && herr) { z.err = true; continue; }
+        int32_t layer = 0; void* dp[2]{ req, &layer };
+        void* data = UnboxPtr(Invoke(getraw, nullptr, dp));
+        if (!data) { z.err = true; continue; }
+        size_t whole = (size_t)z.count * (size_t)z.stride;
+        z.bytes.resize(whole);
+        if (!SafeMemcpy(z.bytes.data(), data, whole)) { z.err = true; continue; }
+        z.done = true;
+        MethodContract* relnow = Contract("gb.release"); // staging bytes captured -> release our buffer
+        if (relnow && relnow->resolved && z.stage) { Invoke(relnow, z.stage, nullptr); z.stage = nullptr; }
     }
-    int32_t layer = 0; void* dp[2]{ req, &layer };
-    void* data = UnboxPtr(Invoke(getraw, nullptr, dp));
-    if (!data) { Log("gpu-probe: path M GetDataRaw null."); return 1; }
+    if (!all_done) return 0;
 
-    // Whole static stream0 = count*stride; trim to vertexCount and cap defensively.
-    int32_t take = R.m_count;
-    if (gp.expect_vc > 0 && take > gp.expect_vc) take = gp.expect_vc;
-    size_t whole = (R.m_count > 0 && R.m_stride > 0) ? (size_t)R.m_count * (size_t)R.m_stride : 0;
-    size_t bytes = whole;
-    if (gp.expect_vc > 0) { size_t want = (size_t)gp.expect_vc * (size_t)R.m_stride; if (want < bytes) bytes = want; }
-    if (bytes < 64) bytes = (whole >= 64) ? 64 : whole;
-    std::vector<uint8_t> buf(bytes);
-    if (!SafeMemcpy(buf.data(), data, bytes)) { Log("gpu-probe: path M memcpy fault."); return 1; }
-
-    // Stream 0 starts with Position Float32x3 at offset 0 (bind-pose model-space coordinates).
-    bool first = true;
-    for (int32_t v = 0; v < take && (size_t)v * (size_t)R.m_stride + 12 <= bytes; ++v) {
-        const float* fp = reinterpret_cast<const float*>(buf.data() + (size_t)v * R.m_stride);
-        BE_Vec3 p{ fp[0], fp[1], fp[2] };
-        if (std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z) &&
-            std::abs(p.x) < 1.0e6f && std::abs(p.y) < 1.0e6f && std::abs(p.z) < 1.0e6f) {
-            ++R.m_finite;
-            if (first) { R.mmn = R.mmx = p; first = false; }
-            else {
-                if (p.x < R.mmn.x) R.mmn.x = p.x; if (p.y < R.mmn.y) R.mmn.y = p.y; if (p.z < R.mmn.z) R.mmn.z = p.z;
-                if (p.x > R.mmx.x) R.mmx.x = p.x; if (p.y > R.mmx.y) R.mmx.y = p.y; if (p.z > R.mmx.z) R.mmx.z = p.z;
+    // Stream0 Position finite/AABB diagnostic (same sanity check as v0.9.1) + first-96-byte hex.
+    {
+        auto& z0 = gp.sr[0];
+        const int32_t stride = z0.stride;
+        int32_t take = z0.count;
+        if (gp.expect_vc > 0 && take > gp.expect_vc) take = gp.expect_vc;
+        bool first = true;
+        if (stride > 0 && !z0.bytes.empty()) {
+            for (int32_t v = 0; v < take && (size_t)v * stride + 12 <= z0.bytes.size(); ++v) {
+                const float* fp = reinterpret_cast<const float*>(z0.bytes.data() + (size_t)v * stride);
+                BE_Vec3 p{ fp[0], fp[1], fp[2] };
+                if (std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z) &&
+                    std::abs(p.x) < 1.0e6f && std::abs(p.y) < 1.0e6f && std::abs(p.z) < 1.0e6f) {
+                    ++R.m_finite;
+                    if (first) { R.mmn = R.mmx = p; first = false; }
+                    else {
+                        if (p.x < R.mmn.x) R.mmn.x = p.x; if (p.y < R.mmn.y) R.mmn.y = p.y; if (p.z < R.mmn.z) R.mmn.z = p.z;
+                        if (p.x > R.mmx.x) R.mmx.x = p.x; if (p.y > R.mmx.y) R.mmx.y = p.y; if (p.z > R.mmx.z) R.mmx.z = p.z;
+                    }
+                }
             }
         }
-    }
-    R.ok = (R.m_finite > 0);
-    if (g_raw_dump.empty() && std::strstr(gp.name.c_str(), "face")) {
-        char rh[160]; std::snprintf(rh, sizeof(rh),
-            "RAWM %s count=%d stride=%d take=%d bytes=%zu\n", gp.name.c_str(), R.m_count, R.m_stride, take, bytes);
-        g_raw_dump = rh;
-        int hb = (int)bytes; if (hb > 192) hb = 192;
-        g_raw_dump += "-- first bytes (offset | hex16 | float32 x4) --\n";
+        R.ok = (R.m_finite > 0);
+        int hb = (int)z0.bytes.size(); if (hb > 96) hb = 96;
+        char rh09[120]; std::snprintf(rh09, sizeof(rh09), "RAWM96 %s mc=%d mst=%d bytes=%zu",
+            gp.name.c_str(), z0.count, z0.stride, z0.bytes.size());
+        R.mraw = rh09;
         for (int off = 0; off < hb; off += 16) {
-            char row[220]; int p = 0;
-            p += std::snprintf(row + p, sizeof(row) - p, "  %04x:", off);
-            for (int j = 0; j < 16 && off + j < hb; ++j)
-                p += std::snprintf(row + p, sizeof(row) - p, " %02x", buf[off + j]);
-            p += std::snprintf(row + p, sizeof(row) - p, "  |");
-            for (int j = 0; j < 16 && off + j + 3 < hb; j += 4) {
-                float fv; std::memcpy(&fv, buf.data() + off + j, 4);
-                p += std::snprintf(row + p, sizeof(row) - p, " %.5g", fv);
-            }
+            char row[120]; int p = std::snprintf(row, sizeof(row), "  %04x:", off);
+            for (int j = 0; j < 16 && off + j < hb; ++j) p += std::snprintf(row + p, sizeof(row) - p, " %02x", z0.bytes[off + j]);
             p += std::snprintf(row + p, sizeof(row) - p, "\n");
             if (p < 0 || p > (int)sizeof(row) - 1) p = (int)sizeof(row) - 1;
-            g_raw_dump += row;
-        }
-    }
-    {
-        int hb09 = (int)bytes; if (hb09 > 96) hb09 = 96;
-        char rh09[96]; std::snprintf(rh09, sizeof(rh09), "RAWM96 %s mc=%d mst=%d bytes=%zu", gp.name.c_str(), R.m_count, R.m_stride, bytes);
-        R.mraw = rh09;
-        for (int off = 0; off < hb09; off += 16) {
-            char row[96]; int p = std::snprintf(row, sizeof(row), "  %04x:", off);
-            for (int j = 0; j < 16 && off + j < hb09; ++j) p += std::snprintf(row + p, sizeof(row) - p, " %02x", buf[off + j]);
-            p += std::snprintf(row + p, sizeof(row) - p, "\n");
-            if (p > (int)sizeof(row) - 1) p = (int)sizeof(row) - 1;
             R.mraw += row;
         }
     }
-    { MethodContract* relnow = Contract("gb.release");
-      if (relnow && relnow->resolved && gp.m_stage) Invoke(relnow, gp.m_stage, nullptr); }
-    char ob[380]; std::snprintf(ob, sizeof(ob),
-        "gpu-probe[%s] pathM OK finite=%d/%d bindAABB %.3f %.3f %.3f ~ %.3f %.3f %.3f (control A got=%d)",
-        gp.name.c_str(), R.m_finite, take, R.mmn.x, R.mmn.y, R.mmn.z, R.mmx.x, R.mmx.y, R.mmx.z, (int)R.a_got); Log(ob);
+    char ob[480]; std::snprintf(ob, sizeof(ob),
+        "gpu-probe[%s] v0.9.2 OK finite=%d/%d s0=%zuB s1=%zuB idx=%d bind=%d bw=%d bones=%d bindAABB %.3f %.3f %.3f ~ %.3f %.3f %.3f",
+        gp.name.c_str(), R.m_finite, gp.expect_vc, gp.sr[0].bytes.size(),
+        gp.nstreams > 1 ? gp.sr[1].bytes.size() : (size_t)0,
+        R.idx_count, R.bind_bones, R.bw_verts, R.bones_n,
+        R.mmn.x, R.mmn.y, R.mmn.z, R.mmx.x, R.mmx.y, R.mmx.z); Log(ob);
     return 1;
 }
 
+// v0.9.2: write a concise overview txt AND a folder of full raw materials per part
+// (stream0/1 vertex bytes, triangle indices, bindposes, bone weights, ordered bone names)
+// for offline Python glTF assembly with zero further game visits.
 void WriteGpuProbeFile(DWORD elapsed_ms) {
     wchar_t local[MAX_PATH];
     const DWORD got = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
@@ -930,38 +1049,90 @@ void WriteGpuProbeFile(DWORD elapsed_ms) {
     const std::wstring root = std::wstring(local) + L"\\BetterEndfield";
     const std::wstring dir = root + L"\\scene-export";
     CreateDirectoryW(root.c_str(), nullptr); CreateDirectoryW(dir.c_str(), nullptr);
-    wchar_t path[MAX_PATH * 2];
-    swprintf_s(path, _countof(path), L"%ls\\chen_gpu_vertex_%llu.txt", dir.c_str(),
-        static_cast<unsigned long long>(GetTickCount64()));
-    FILE* file = nullptr;
-    if (_wfopen_s(&file, path, L"w, ccs=UTF-8") != 0 || !file) { Log("gpu-probe: open output fail."); return; }
-    int okcnt = 0; for (auto& gp : g_gpu_parts) if (gp.pr.ok) ++okcnt;
-    fwprintf(file, L"Chen bind-pose STATIC vertex readback v0.9.1 (Mesh.GetVertexBuffer(0) static buffer -> Graphics.CopyBuffer into CopySource|CopyDestination staging -> AsyncGPUReadback; SMR current-frame is control only; no game target mutated)  %lu ms\n",
-        (unsigned long)elapsed_ms);
-    fwprintf(file, L"DEVICE type=%d name='%ls' supportsAsyncGPUReadback method=%d prop=%d  (type 21=Vulkan 6=D3D11 12=D3D12)\n",
-        g_dev_type, Utf8ToWide(g_dev_name).c_str(), (int)g_sup_method, (int)g_sup_prop);
-    fwprintf(file, L"parts: %d, pathM(static bind-pose) readback ok: %d\n\n", (int)g_gpu_parts.size(), okcnt);
-    fwprintf(file, L"%-28ls %6s %4s %7s %6s %8s %6s %5s\n",
-        L"part", L"expect", L"vis", L"Mcnt", L"Mstd", L"Mfinite", L"Actrl", L"ok");
-    for (auto& gp : g_gpu_parts) {
-        const GpuPartResult& R = gp.pr; const std::wstring wn = Utf8ToWide(R.name);
-        fwprintf(file, L"%-28ls %6d %4d %7d %6d %8d %6d %5s\n", wn.c_str(),
-            R.expect_vc, R.vis, R.m_count, R.m_stride, R.m_finite, (int)R.a_got, R.ok ? L"TRUE" : L"false");
-        fwprintf(file, L"    pathM(static mesh): readable=%d srcGot=%d c=%d st=%d tg=%d stage=%d copy=%d reqErr=%d\n",
-            R.m_readable, (int)R.m_src_got, R.m_count, R.m_stride, R.m_target, (int)R.m_stage_built, (int)R.m_copy_ok, (int)R.m_req_haserr);
-        fwprintf(file, L"    control pathA(SMR current-frame): got=%d c=%d st=%d tg=%d\n",
-            (int)R.a_got, R.a_count, R.a_stride, R.a_target);
-        fwprintf(file, L"    layout: %ls\n", Utf8ToWide(R.layout).c_str());
-        fwprintf(file, L"    bindPose Position AABB min %.5f %.5f %.5f  max %.5f %.5f %.5f  size %.5f %.5f %.5f\n",
-            R.mmn.x, R.mmn.y, R.mmn.z, R.mmx.x, R.mmx.y, R.mmx.z,
-            R.mmx.x - R.mmn.x, R.mmx.y - R.mmn.y, R.mmx.z - R.mmn.z);
-        if (!R.mraw.empty()) fwprintf(file, L"    %ls\n", Utf8ToWide(R.mraw).c_str());
-        fwprintf(file, L"\n");
+    const unsigned long long tick64 = GetTickCount64();
+
+    wchar_t rdir[MAX_PATH * 2];
+    swprintf_s(rdir, _countof(rdir), L"%ls\\chen_raw_%llu", dir.c_str(), tick64);
+    CreateDirectoryW(rdir, nullptr);
+
+    auto DumpBin = [&](const wchar_t* fname, const std::vector<uint8_t>& bytes) -> bool {
+        if (bytes.empty() || !fname) return false;
+        wchar_t fp[MAX_PATH * 3]; swprintf_s(fp, _countof(fp), L"%ls\\%ls", rdir, fname);
+        FILE* f = nullptr; if (_wfopen_s(&f, fp, L"wb") != 0 || !f) return false;
+        size_t w = fwrite(bytes.data(), 1, bytes.size(), f); fclose(f); return w == bytes.size();
+    };
+
+    // ---- per-part manifest + raw files ----
+    wchar_t mf[MAX_PATH * 3]; swprintf_s(mf, _countof(mf), L"%ls\\manifest.txt", rdir);
+    FILE* man = nullptr;
+    if (_wfopen_s(&man, mf, L"w, ccs=UTF-8") == 0 && man) {
+        fwprintf(man, L"Chen raw material capture v0.9.2  %lu ms\n", (unsigned long)elapsed_ms);
+        fwprintf(man, L"DEVICE type=%d name='%ls'\n\n", g_dev_type, Utf8ToWide(g_dev_name).c_str());
+        for (auto& gp : g_gpu_parts) {
+            const GpuPartResult& R = gp.pr;
+            const std::wstring wn = Utf8ToWide(gp.name);
+            for (int s = 0; s < gp.nstreams; ++s) {
+                wchar_t fn[192]; swprintf_s(fn, _countof(fn), L"%hs_s%d.bin", gp.name.c_str(), s);
+                DumpBin(fn, gp.sr[s].bytes);
+            }
+            if (!gp.indices.empty()) {
+                std::vector<uint8_t> raw(gp.indices.size() * 4);
+                std::memcpy(raw.data(), gp.indices.data(), raw.size());
+                wchar_t fn[192]; swprintf_s(fn, _countof(fn), L"%hs_idx.bin", gp.name.c_str());
+                DumpBin(fn, raw);
+            }
+            if (!gp.bindposes.empty()) { wchar_t fn[192]; swprintf_s(fn, _countof(fn), L"%hs_bind.bin", gp.name.c_str()); DumpBin(fn, gp.bindposes); }
+            if (!gp.boneweights.empty()) { wchar_t fn[192]; swprintf_s(fn, _countof(fn), L"%hs_bw.bin", gp.name.c_str()); DumpBin(fn, gp.boneweights); }
+            if (!gp.bones_names.empty()) {
+                wchar_t fn[192]; swprintf_s(fn, _countof(fn), L"%hs_bones.txt", gp.name.c_str());
+                wchar_t bp[MAX_PATH * 3]; swprintf_s(bp, _countof(bp), L"%ls\\%ls", rdir, fn);
+                FILE* bf = nullptr;
+                if (_wfopen_s(&bf, bp, L"w, ccs=UTF-8") == 0 && bf) {
+                    fwprintf(bf, L"%ls", Utf8ToWide(gp.bones_names).c_str()); fclose(bf);
+                }
+            }
+            fwprintf(man, L"[%ls] vertexCount=%d readable=%d nstreams=%d\n", wn.c_str(), gp.expect_vc, R.m_readable, gp.nstreams);
+            for (int s = 0; s < gp.nstreams; ++s)
+                fwprintf(man, L"  stream%d count=%d stride=%d bytes=%zu dispatched=%d done=%d err=%d\n",
+                    s, R.s_count[s], R.s_stride[s], gp.sr[s].bytes.size(),
+                    (int)gp.sr[s].dispatched, (int)gp.sr[s].done, (int)gp.sr[s].err);
+            fwprintf(man, L"  layout: %ls\n", Utf8ToWide(R.layout).c_str());
+            fwprintf(man, L"  submesh=%d indices=%d got=%d ; bindposes=%d got=%d ; bwVerts=%d got=%d ; bones=%d got=%d\n",
+                R.submesh_count, R.idx_count, (int)R.idx_got, R.bind_bones, (int)R.bind_got,
+                R.bw_verts, (int)R.bw_got, R.bones_n, (int)R.bones_got);
+            fwprintf(man, L"  sub_idxcount:");
+            for (size_t k = 0; k < gp.sub_idxcount.size(); ++k) fwprintf(man, L" %d", gp.sub_idxcount[k]);
+            fwprintf(man, L"\n");
+            fwprintf(man, L"  bindPose Position AABB %.5f %.5f %.5f ~ %.5f %.5f %.5f finite=%d\n",
+                R.mmn.x, R.mmn.y, R.mmn.z, R.mmx.x, R.mmx.y, R.mmx.z, R.m_finite);
+            if (!R.mraw.empty()) fwprintf(man, L"  %ls\n", Utf8ToWide(R.mraw).c_str());
+            fwprintf(man, L"\n");
+        }
+        fclose(man);
     }
-    if (!g_raw_dump.empty()) fwprintf(file, L"\n%ls", Utf8ToWide(g_raw_dump).c_str());
+
+    // ---- concise overview for quick success/failure reading ----
+    wchar_t path[MAX_PATH * 2];
+    swprintf_s(path, _countof(path), L"%ls\\chen_gpu_vertex_%llu.txt", dir.c_str(), tick64);
+    FILE* file = nullptr;
+    if (_wfopen_s(&file, path, L"w, ccs=UTF-8") != 0 || !file) { Log("gpu-probe: open overview fail."); return; }
+    int okcnt = 0; for (auto& gp : g_gpu_parts) if (gp.pr.ok) ++okcnt;
+    fwprintf(file, L"Chen v0.9.2 raw capture overview  %lu ms (full materials in chen_raw_%llu)\n", (unsigned long)elapsed_ms, tick64);
+    fwprintf(file, L"DEVICE type=%d name='%ls'\n", g_dev_type, Utf8ToWide(g_dev_name).c_str());
+    fwprintf(file, L"parts: %d, stream0 readback ok: %d\n\n", (int)g_gpu_parts.size(), okcnt);
+    fwprintf(file, L"%-28ls %6s %5s %7s %6s %9s %6s %6s %6s %6s %5s\n",
+        L"part", L"expect", L"read", L"s0cnt", L"s0st", L"s0bytes", L"idx", L"bind", L"bw", L"bones", L"ok");
+    for (auto& gp : g_gpu_parts) {
+        const GpuPartResult& R = gp.pr;
+        const std::wstring wn = Utf8ToWide(gp.name);
+        fwprintf(file, L"%-28ls %6d %5d %7d %6d %9zu %6d %6d %6d %6d %5s\n", wn.c_str(),
+            gp.expect_vc, R.m_readable, R.s_count[0], R.s_stride[0], gp.sr[0].bytes.size(),
+            R.idx_count, R.bind_bones, R.bw_verts, R.bones_n, R.ok ? L"TRUE" : L"false");
+    }
     fclose(file);
-    char m[200]; std::snprintf(m, sizeof(m),
-        "gpu-probe file written: %d/%d parts pathM(static bind-pose) read back.", okcnt, (int)g_gpu_parts.size()); Log(m);
+    char m[260]; std::snprintf(m, sizeof(m),
+        "gpu-probe v0.9.2 written: %d/%d parts; raw folder chen_raw_%llu.", okcnt, (int)g_gpu_parts.size(), tick64);
+    Log(m);
 }
 
 // Driven every frame by DetourPump. Wait >=3 frames for re-skinning, collect
@@ -984,16 +1155,18 @@ void TickGpuVertexReadback() {
         Log("gpu-probe: wait budget exhausted, finalize with whatever is ready.");
     }
     WriteGpuProbeFile(GetTickCount() - g_gpu_start_tick);
-    // v0.9.0: never set any game target, so nothing to restore; release our staging GraphicsBuffer.
+    // Release any staging buffer that never finished (finished ones already released in phase 2).
     { MethodContract* rel09 = Contract("gb.release");
-      for (auto& gp : g_gpu_parts) if (rel09 && rel09->resolved && gp.m_stage) Invoke(rel09, gp.m_stage, nullptr); }
+      for (auto& gp : g_gpu_parts) for (int s = 0; s < gp.nstreams; ++s)
+          if (rel09 && rel09->resolved && gp.sr[s].stage) Invoke(rel09, gp.sr[s].stage, nullptr); }
     for (auto& gp : g_gpu_parts) {
         if (gp.renderer_root) g_host->gchandle_free(g_host->context, gp.renderer_root);
         if (gp.mesh_root) g_host->gchandle_free(g_host->context, gp.mesh_root);
-        if (gp.b0gb_root) g_host->gchandle_free(g_host->context, gp.b0gb_root);
-        if (gp.req_root) g_host->gchandle_free(g_host->context, gp.req_root);
-        if (gp.msrc_root) g_host->gchandle_free(g_host->context, gp.msrc_root);
-        if (gp.mstage_root) g_host->gchandle_free(g_host->context, gp.mstage_root);
+        for (int s = 0; s < 3; ++s) {
+            if (gp.sr[s].src_root)   g_host->gchandle_free(g_host->context, gp.sr[s].src_root);
+            if (gp.sr[s].stage_root) g_host->gchandle_free(g_host->context, gp.sr[s].stage_root);
+            if (gp.sr[s].req_root)   g_host->gchandle_free(g_host->context, gp.sr[s].req_root);
+        }
     }
     g_gpu_parts.clear();
     g_gpu_phase.store(0, std::memory_order_release);
@@ -1164,7 +1337,7 @@ BE_Result BE_CALL Initialize(const BE_HostApiV1* host) {
 
     g_input_stop.store(false, std::memory_order_release);
     g_input_thread = std::thread(InputThreadMain);
-    Log("Scene Exporter v0.9.1 ready (READ-ONLY: Mesh static bind-pose buffer -> Graphics.CopyBuffer staging -> AsyncGPUReadback; SMR current-frame is control only; no target mutation). Focus game, stand Chen at MID range full body, press Ctrl+E.");
+    Log("Scene Exporter v0.9.2 ready (READ-ONLY full raw capture: vertex streams 0/1 via CopyBuffer staging -> AsyncGPUReadback + CPU indices/bindposes/weights/bones -> chen_raw folder; no target mutation). Focus game, stand Chen at MID range full body, press Ctrl+E.");
     return BE_Result_Ok;
 }
 
@@ -1202,7 +1375,7 @@ void BE_CALL Shutdown() {
 }
 
 const BE_ModuleApiV1 kApi{
-    {kModuleId, "Scene Exporter", "0.9.1", BETTER_ENDFIELD_MODULE_ABI_V1},
+    {kModuleId, "Scene Exporter", "0.9.2", BETTER_ENDFIELD_MODULE_ABI_V1},
     &Initialize, &ConfigurationChanged, &Shutdown};
 
 } // namespace
