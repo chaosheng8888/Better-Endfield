@@ -1,6 +1,9 @@
-// BetterEndfield Scene Exporter — v0.7.3 (S4-2: Mesh.MeshDataArray read-only direct channel
-// CopyAttributeIntoPtr with checkReadWrite=false to bypass isReadable=false GPU-resident meshes;
-// keep per-part BakeMesh as cross-check; hotkey Ctrl+E).
+// BetterEndfield Scene Exporter — v0.7.4 (GPU skinned-vertex readback:
+// SMR.set_vertexBufferTarget(Vertex|CopySource) -> wait frames -> SMR.GetVertexBuffer() current-frame
+// skinned GPU buffer -> AsyncGPUReadback.Request/WaitForCompletion/GetDataRaw -> parse Position.
+// This is the ONLY channel for isReadable=false GPU-resident skinned meshes; vertices/MeshData/BakeMesh
+// all need a CPU copy and stay empty for those parts (proven in v0.7.0~v0.7.3). Cross-frame state
+// machine driven every frame by DetourPump -> TickGpuVertexReadback. Hotkey Ctrl+E).
 //
 // S3 目标（只验证链路，不导网格）：游戏内按组合热键(Ctrl+E)，在 Unity 主线程枚举
 // “当前已加载场景”里指定类型的全部对象，把数量和名字写到本地 txt。
@@ -117,6 +120,52 @@ MethodContract g_contracts[]{
             "CopyAttributeIntoPtr",
             "System.IntPtr|UnityEngine.Rendering.VertexAttribute|UnityEngine.Rendering.VertexAttributeFormat|System.Int32|System.IntPtr",
             "System.Void", 5}},
+    // ===== v0.7.4 GPU skinned-vertex readback chain (RVAs verified against IL2CPP dump) =====
+    // Parameter-type strings are intentionally left null so the host matches by method name +
+    // parameter count only (avoids exact-name pitfalls for nested enums / generic Action).
+    // SMR.set_vertexBufferTarget(GraphicsBuffer.Target value type): request a CopySource-capable
+    // vertex buffer binding. We pass Vertex(1)|CopySource(4)=5 at call time.
+    {"skinned.set_vbt",
+        {"UnityEngine.CoreModule.dll", "UnityEngine", "SkinnedMeshRenderer",
+            "set_vertexBufferTarget", nullptr, "System.Void", 1}},
+    // SMR.GetVertexBuffer() -> GraphicsBuffer: current-frame already-skinned GPU vertex buffer.
+    {"skinned.get_vb",
+        {"UnityEngine.CoreModule.dll", "UnityEngine", "SkinnedMeshRenderer",
+            "GetVertexBuffer", nullptr, "UnityEngine.GraphicsBuffer", 0}},
+    // GraphicsBuffer.get_count / get_stride (instance, no args -> int).
+    {"gb.get_count",
+        {"UnityEngine.CoreModule.dll", "UnityEngine", "GraphicsBuffer",
+            "get_count", nullptr, "System.Int32", 0}},
+    {"gb.get_stride",
+        {"UnityEngine.CoreModule.dll", "UnityEngine", "GraphicsBuffer",
+            "get_stride", nullptr, "System.Int32", 0}},
+    // Mesh.GetVertexAttributeCountImpl() -> int (vertex channel count; layout metadata stays readable).
+    {"mesh.attr_count",
+        {"UnityEngine.CoreModule.dll", "UnityEngine", "Mesh",
+            "GetVertexAttributeCountImpl", nullptr, "System.Int32", 0}},
+    // Mesh.GetVertexAttribute(int) -> VertexAttributeDescriptor (boxed value type, unbox 16 bytes).
+    {"mesh.get_attr",
+        {"UnityEngine.CoreModule.dll", "UnityEngine", "Mesh",
+            "GetVertexAttribute", nullptr, nullptr, 1}},
+    // AsyncGPUReadback.Request(ComputeBuffer, Action) static -> AsyncGPUReadbackRequest (boxed).
+    // Name "Request" + 2 params uniquely selects the ComputeBuffer overload (Texture overloads have 4).
+    {"gpuread.request",
+        {"UnityEngine.CoreModule.dll", "UnityEngine.Rendering", "AsyncGPUReadback",
+            "Request", nullptr, nullptr, 2}},
+    // AsyncGPUReadbackRequest INSTANCE methods (this = the boxed request returned by Request).
+    {"gpr.wait",
+        {"UnityEngine.CoreModule.dll", "UnityEngine.Rendering", "AsyncGPUReadbackRequest",
+            "WaitForCompletion", nullptr, "System.Void", 0}},
+    {"gpr.has_error",
+        {"UnityEngine.CoreModule.dll", "UnityEngine.Rendering", "AsyncGPUReadbackRequest",
+            "HasError", nullptr, "System.Boolean", 0}},
+    {"gpr.get_data_raw",
+        {"UnityEngine.CoreModule.dll", "UnityEngine.Rendering", "AsyncGPUReadbackRequest",
+            "GetDataRaw", "System.Int32", "System.IntPtr", 1}},
+    // SystemInfo.SupportsAsyncGPUReadback() static -> bool (device capability probe, optional).
+    {"sysinfo.supports_gpr",
+        {"UnityEngine.CoreModule.dll", "UnityEngine", "SystemInfo",
+            "SupportsAsyncGPUReadback", nullptr, "System.Boolean", 0}},
 };
 
 using PumpFn = void(__fastcall*)(void* instance, void* method);
@@ -138,6 +187,11 @@ std::atomic_int g_hotkey{VK_F9};
 std::atomic_bool g_input_stop{false};
 std::thread g_input_thread;
 std::atomic_bool g_contracts_ready{false};
+
+// v0.7.4 cross-frame GPU readback state (see TickGpuVertexReadback).
+std::atomic_int g_gpu_phase{0}; // 0=idle, 1=waiting skin frames / reading back
+int g_gpu_wait = 0;
+DWORD g_gpu_start_tick = 0;
 
 void Log(const std::string& message) {
     if (g_host && g_host->log) {
@@ -480,284 +534,287 @@ int32_t ArrayLengthOf(MethodContract* get_length, void* arr) {
     return len;
 }
 
-// 顶点坐标探针（v0.7.0）：收集所有 S_actor_chen_*_lod0 部件，优先走 MeshData 只读直读，
-// （杜绝复用残留串味），对照 sharedMesh（运行时常 isReadable=false→空）与烘焙结果并记录 isVisible，
-// 写“每部件对照表”，并对第一个烘焙出非空顶点的部件完整读 xyz、算 AABB、抽样坐标验证正确性。
-void ExportVertexProbe() {
+// ===========================================================================
+// v0.7.4 GPU skinned-vertex readback — the only channel that works for
+// isReadable=false GPU-resident skinned meshes. Cross-frame state machine:
+//   Start (Ctrl+E frame): enumerate Chen lod0 parts, set vertexBufferTarget,
+//     pin renderer/mesh with GCHandle across frames;
+//   Tick (each following frame): wait >=3 frames for the SMR to re-skin into
+//     the CopySource buffer, then per part GetVertexBuffer -> AsyncGPUReadback
+//     -> WaitForCompletion -> GetDataRaw, parse Position; finalize when all
+//     parts are collected (or after a 12-frame budget).
+// ===========================================================================
+
+struct BE_VAD { int32_t attribute, format, dimension, stream; }; // VertexAttributeDescriptor (16 bytes past header)
+
+struct GpuPartResult {
+    std::string name;
+    int32_t expect_vc = -1, count = -1, stride = -1;
+    int32_t pos_off = -1, pos_fmt = -1, pos_dim = 0, n_finite = 0;
+    bool got_buffer = false, req_error = false, ok = false;
+    std::string layout;
+    BE_Vec3 mn{0,0,0}, mx{0,0,0};
+};
+
+struct GpuPart {
+    uint32_t renderer_root = 0; void* renderer = nullptr;
+    uint32_t mesh_root = 0;     void* mesh = nullptr;
+    std::string name;
+    int32_t expect_vc = 0;
+    bool collected = false;
+    GpuPartResult pr;
+};
+
+std::vector<GpuPart> g_gpu_parts;
+
+int32_t UnboxInt(void* boxed, int32_t fallback = -1) {
+    if (!boxed) return fallback;
+    int32_t v = fallback; bool f = false;
+    return (SafeUnbox(boxed, &v, sizeof(v), &f) && !f) ? v : fallback;
+}
+void* UnboxPtr(void* boxed) {
+    if (!boxed) return nullptr;
+    void* p = nullptr; bool f = false;
+    return (SafeUnbox(boxed, &p, sizeof(p), &f) && !f) ? p : nullptr;
+}
+// SEH-wrapped memcpy (only POD here, so __try is legal).
+bool SafeMemcpy(void* dst, const void* src, size_t n) {
+    if (!dst || !src || n == 0) return false;
+    __try { std::memcpy(dst, src, n); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+int VertexFormatBytes(int fmt) {
+    switch (fmt) {
+        case 0: return 4;                                   // Float32
+        case 1: return 2;                                   // Float16
+        case 2: case 3: case 4: case 5: return 1;          // UNorm8/SNorm8/UInt8/SInt8
+        case 6: case 7: case 8: case 9: case 10: return 2; // 16-bit
+        case 11: case 12: return 4;                        // UInt32/SInt32
+        default: return 4;
+    }
+}
+
+// Stage 1 (the Ctrl+E frame): enumerate Chen lod0 parts, request the readback
+// binding target, and pin objects for the next frames.
+void StartGpuVertexReadback() {
+    if (g_gpu_phase.load(std::memory_order_acquire) != 0) {
+        Log("gpu-probe: a pass is already running, ignore this trigger."); return;
+    }
     MethodContract* find_all = Contract("object.find_all_of_type");
     MethodContract* get_name = Contract("object.get_name");
     MethodContract* get_length = Contract("array.get_length");
     MethodContract* get_value = Contract("array.get_value");
     MethodContract* get_mesh = Contract("skinned.get_shared_mesh");
     MethodContract* get_vcount = Contract("mesh.get_vertex_count");
-    MethodContract* get_verts = Contract("mesh.get_vertices");
-    MethodContract* m_ctor = Contract("mesh.ctor");
-    MethodContract* m_readable = Contract("mesh.is_readable");
-    MethodContract* bake = Contract("skinned.bake_mesh");
-    MethodContract* get_visible = Contract("renderer.is_visible");
-    MethodContract* mesh_acquire_ro = Contract("mesh.acquire_ro");
-    MethodContract* mda_dispose = Contract("mda.dispose");
-    MethodContract* md_vcount = Contract("md.vcount");
-    MethodContract* md_copy = Contract("md.copy_pos");
-    if (!g_skinned_type || !g_mesh_class_info ||
-        !find_all->resolved || !get_name->resolved || !get_length->resolved || !get_value->resolved ||
-        !get_mesh->resolved || !get_vcount->resolved || !get_verts->resolved ||
-        !m_ctor->resolved || !m_readable->resolved || !bake->resolved || !get_visible->resolved) {
-        Log("vertex-probe skipped: contracts/type not ready.");
-        return;
+    MethodContract* set_vbt = Contract("skinned.set_vbt");
+    MethodContract* sup = Contract("sysinfo.supports_gpr");
+    if (!g_skinned_type || !find_all->resolved || !get_name->resolved ||
+        !get_length->resolved || !get_value->resolved || !get_mesh->resolved ||
+        !get_vcount->resolved || !set_vbt->resolved) {
+        Log("gpu-probe start skipped: base contracts not ready."); return;
     }
-    static const char* kPrefix = "S_actor_chen_";
-    static const char* kLodTag = "_lod0";
-    const size_t kPrefixLen = std::strlen(kPrefix);
-    const int32_t kPartCap = 20;
-    const int32_t kVertCap = 80000;
+    if (sup->resolved) {
+        bool ok = false, ef = false;
+        if (SafeUnbox(Invoke(sup, nullptr, nullptr), &ok, sizeof(ok), &ef) && !ef) {
+            char b[96]; std::snprintf(b, sizeof(b),
+                "gpu-probe: SystemInfo.supportsAsyncGPUReadback=%d", (int)ok); Log(b);
+        }
+    }
 
-    const DWORD t0 = GetTickCount();
-    Log("vertex-probe: collecting all Chen lod0 parts ...");
-    void* find_params[1]{ g_skinned_type };
-    void* objs = Invoke(find_all, nullptr, find_params);
-    if (!objs) { Log("vertex-probe: enumerate failed."); return; }
+    void* fp[1]{ g_skinned_type };
+    void* objs = Invoke(find_all, nullptr, fp);
+    if (!objs) { Log("gpu-probe: enumerate SMR failed."); return; }
     const int32_t total = ArrayLengthOf(get_length, objs);
-    if (total < 0) { Log("vertex-probe: length failed."); return; }
+    if (total < 0) { Log("gpu-probe: array length failed."); return; }
 
-    struct Part { void* renderer; std::string name; };
-    std::vector<Part> parts;
-    for (int32_t i = 0; i < total && static_cast<int32_t>(parts.size()) < kPartCap; ++i) {
-        int32_t idx = i;
-        void* ip[1]{&idx};
+    static const char* kPrefix = "S_actor_chen_";
+    static const char* kLod = "_lod0";
+    const size_t kpl = std::strlen(kPrefix);
+    const int32_t kTarget = 5; // GraphicsBuffer.Target Vertex(1)|CopySource(4)
+    g_gpu_parts.clear();
+    for (int32_t i = 0; i < total && static_cast<int32_t>(g_gpu_parts.size()) < 20; ++i) {
+        int32_t idx = i; void* ip[1]{ &idx };
         void* r = Invoke(get_value, objs, ip);
         if (!r) continue;
-        char nb[256]{};
-        bool nf = false;
+        char nb[256]{}; bool nf = false;
         void* no = Invoke(get_name, r, nullptr);
-        if (!nf && SafeCopyName(no, nb, sizeof(nb), &nf) > 0) {
-            if (std::strncmp(nb, kPrefix, kPrefixLen) == 0 && std::strstr(nb, kLodTag))
-                parts.push_back(Part{ r, nb });
-        }
+        if (SafeCopyName(no, nb, sizeof(nb), &nf) <= 0) continue;
+        if (std::strncmp(nb, kPrefix, kpl) != 0 || !std::strstr(nb, kLod)) continue;
+        void* mesh = Invoke(get_mesh, r, nullptr);
+        if (!mesh) { char w[256]; std::snprintf(w, sizeof(w), "gpu-probe: %s has no sharedMesh, skip.", nb); Log(w); continue; }
+        const int32_t vc = UnboxInt(Invoke(get_vcount, mesh, nullptr));
+        int32_t target = kTarget; void* sp[1]{ &target }; // enum value type: pass by address
+        Invoke(set_vbt, r, sp);
+        const uint32_t rr = g_host->gchandle_new(g_host->context, r, 0);
+        const uint32_t mr = g_host->gchandle_new(g_host->context, mesh, 0);
+        GpuPart gp; gp.renderer_root = rr; gp.renderer = r;
+        gp.mesh_root = mr; gp.mesh = mesh; gp.name = nb; gp.expect_vc = vc;
+        g_gpu_parts.push_back(std::move(gp));
     }
-    if (parts.empty()) { Log("vertex-probe: no S_actor_chen_*_lod0 part loaded."); return; }
-    {
-        char m[128];
-        std::snprintf(m, sizeof(m), "vertex-probe: %d Chen lod0 parts collected.",
-            static_cast<int>(parts.size()));
-        Log(m);
-    }
-
-    struct Row { std::string name; int32_t svc, slen, blen, mdvc; bool readable, visible, mdok; };
-    std::vector<Row> rows;
-    bool sampled = false;
-    std::string sample_name;
-    std::vector<BE_Vec3> spts;
-    BE_Vec3 smn{0, 0, 0}, smx{0, 0, 0};
-    int sfail = 0, sbvc = 0;
-
-    for (size_t pi = 0; pi < parts.size(); ++pi) {
-        void* r = parts[pi].renderer;
-
-        // 该部件当前是否在任意相机画面内。
-        bool visible = false;
-        { bool vf = false, vv = false;
-          if (SafeUnbox(Invoke(get_visible, r, nullptr), &vv, sizeof(vv), &vf)) visible = vv; }
-
-        void* shared = Invoke(get_mesh, r, nullptr);
-        int32_t svc = -1, slen = -1;
-        bool readable = false;
-        if (shared) {
-            bool vf = false; int32_t vc = 0;
-            if (SafeUnbox(Invoke(get_vcount, shared, nullptr), &vc, sizeof(vc), &vf)) svc = vc;
-            bool rf = false, rd = false;
-            if (SafeUnbox(Invoke(m_readable, shared, nullptr), &rd, sizeof(rd), &rf)) readable = rd;
-            slen = ArrayLengthOf(get_length, Invoke(get_verts, shared, nullptr));
-        }
-
-        // v0.7.3 MeshData 只读直读 + 逐步诊断日志（定位运行时断点）。
-        int32_t mdvc = -1;
-        bool mdok = false;
-        auto mdlog = [&](const char* stage) {
-            char dbg[256];
-            std::snprintf(dbg, sizeof(dbg), "md-stage[%s] %s", parts[pi].name.c_str(), stage);
-            Log(dbg);
-        };
-        if (!(shared && mesh_acquire_ro->resolved && mda_dispose->resolved &&
-              md_vcount->resolved && md_copy->resolved)) {
-            mdlog("guard-fail contract/shared null");
-        } else {
-            // 公共静态入口：Mesh 是引用类型，参数直接放对象指针本身(不是取地址)；返回装箱的 MeshDataArray。
-            bool af = false;
-            void* ap[1]{ shared };
-            void* boxed_mda = SafeRuntimeInvoke(mesh_acquire_ro->method_info, nullptr, ap, nullptr, &af);
-            if (af || !boxed_mda) { mdlog("acquire invoke-fail/null"); }
-            else {
-                // unbox 后字段起点：m_Ptrs@0(IntPtr*)、m_Length@8(int)（dump 标注 0x10/0x18 已含对象头）。
-                struct MDA { void** ptrs; int32_t len; };
-                MDA mda{ nullptr, 0 };
-                bool uf = false;
-                bool unboxed = SafeUnbox(boxed_mda, &mda, sizeof(mda), &uf);
-                if (!unboxed || uf) { mdlog("unbox-fail"); }
-                else {
-                    char ib[200];
-                    std::snprintf(ib, sizeof(ib), "acquire-ok len=%d ptrs=%p p0=%p", mda.len,
-                        static_cast<void*>(mda.ptrs),
-                        mda.ptrs ? static_cast<void*>(mda.ptrs[0]) : nullptr);
-                    mdlog(ib);
-                    if (!(mda.ptrs != nullptr && mda.len >= 1 && mda.ptrs[0] != nullptr)) {
-                        mdlog("ptrs-invalid");
-                    } else {
-                        void* self = mda.ptrs[0]; // 第一个 MeshData 的内部指针
-                        void* vp[1]{ &self };
-                        bool vf2 = false;
-                        void* vc_ret = SafeRuntimeInvoke(md_vcount->method_info, nullptr, vp, nullptr, &vf2);
-                        if (vf2 || !vc_ret) { mdlog("vcount invoke-fail"); }
-                        else {
-                            bool uf2 = false;
-                            bool vok = SafeUnbox(vc_ret, &mdvc, sizeof(mdvc), &uf2);
-                            if (!vok || uf2) { mdlog("vcount unbox-fail"); }
-                            else if (mdvc <= 0) {
-                                char tb[128]; std::snprintf(tb, sizeof(tb), "vcount non-positive=%d", mdvc);
-                                mdlog(tb);
-                            } else {
-                                const size_t bytes = static_cast<size_t>(mdvc) * sizeof(BE_Vec3);
-                                void* dst = HeapAlloc(GetProcessHeap(), 0, bytes);
-                                if (!dst) { mdlog("heap-alloc-fail"); }
-                                else {
-                                    // 0xFF 填充后每个 float 是 NaN 哨兵；只有被真实顶点覆盖首点才会变有限数。
-                                    std::memset(dst, 0xFF, bytes);
-                                    int32_t attr = 0 /*Position*/, fmt = 0 /*Float32*/, dim = 3;
-                                    bool pf = false;
-                                    void* pp[5]{ &self, &attr, &fmt, &dim, &dst };
-                                    SafeRuntimeInvoke(md_copy->method_info, nullptr, pp, nullptr, &pf);
-                                    const BE_Vec3* vv = static_cast<const BE_Vec3*>(dst);
-                                    if (pf) { mdlog("copy threw csharp-exception"); }
-                                    else if (!(std::isfinite(vv[0].x) && std::isfinite(vv[0].y) &&
-                                               std::isfinite(vv[0].z))) {
-                                        mdlog("first-vertex NaN not-written");
-                                    } else {
-                                        mdok = true;
-                                        char okb[160]; std::snprintf(okb, sizeof(okb), "OK vc=%d", mdvc);
-                                        mdlog(okb);
-                                        // MeshData 通道优先抽样（绑定姿态=模型局部坐标、真实形状）。
-                                        if (!sampled) {
-                                            sampled = true;
-                                            sample_name = parts[pi].name;
-                                            sbvc = mdvc;
-                                            const int32_t n = mdvc < kVertCap ? mdvc : kVertCap;
-                                            spts.reserve(n);
-                                            for (int32_t vi = 0; vi < n; ++vi) {
-                                                BE_Vec3 p = vv[vi];
-                                                if (spts.empty()) { smn = smx = p; }
-                                                else {
-                                                    if (p.x < smn.x) smn.x = p.x; if (p.y < smn.y) smn.y = p.y; if (p.z < smn.z) smn.z = p.z;
-                                                    if (p.x > smx.x) smx.x = p.x; if (p.y > smx.y) smx.y = p.y; if (p.z > smx.z) smx.z = p.z;
-                                                }
-                                                spts.push_back(p);
-                                            }
-                                        }
-                                    }
-                                    HeapFree(GetProcessHeap(), 0, dst);
-                                }
-                            }
-                        }
-                    }
-                }
-                SafeRuntimeInvoke(mda_dispose->method_info, boxed_mda, nullptr, nullptr, &af);
-            }
-        }
-
-        // 每个部件用一个全新烘焙 Mesh（不复用），从根上杜绝上一部件数据残留串味。
-        int32_t blen = -1, bvc = -1;
-        void* baked = g_host->object_new(g_host->context, g_mesh_class_info);
-        if (baked) {
-            Invoke(m_ctor, baked, nullptr);
-            const uint32_t bh = g_host->gchandle_new(g_host->context, baked, 0);
-            void* bake_params[1]{ baked };
-            Invoke(bake, r, bake_params);
-            blen = ArrayLengthOf(get_length, Invoke(get_verts, baked, nullptr));
-            { bool f = false; int32_t v = 0;
-              if (SafeUnbox(Invoke(get_vcount, baked, nullptr), &v, sizeof(v), &f)) bvc = v; }
-
-            if (!sampled && blen > 0) {
-                sampled = true;
-                sample_name = parts[pi].name;
-                sbvc = bvc;
-                void* barr = Invoke(get_verts, baked, nullptr);
-                const int32_t n = blen < kVertCap ? blen : kVertCap;
-                spts.reserve(n);
-                for (int32_t i = 0; i < n; ++i) {
-                    int32_t idx = i;
-                    void* vp[1]{&idx};
-                    BE_Vec3 p{0, 0, 0};
-                    bool pf = false;
-                    void* box = Invoke(get_value, barr, vp);
-                    if (!box || !SafeUnbox(box, &p, sizeof(BE_Vec3), &pf)) { ++sfail; continue; }
-                    if (spts.empty()) { smn = smx = p; }
-                    else {
-                        if (p.x < smn.x) smn.x = p.x; if (p.y < smn.y) smn.y = p.y; if (p.z < smn.z) smn.z = p.z;
-                        if (p.x > smx.x) smx.x = p.x; if (p.y > smx.y) smx.y = p.y; if (p.z > smx.z) smx.z = p.z;
-                    }
-                    spts.push_back(p);
-                }
-            }
-            if (bh) g_host->gchandle_free(g_host->context, bh);
-        }
-        rows.push_back(Row{ parts[pi].name, svc, slen, blen, mdvc, readable, visible, mdok });
-    }
-
-    int shared_nonempty = 0, baked_nonempty = 0, md_nonempty = 0;
-    for (auto& rw : rows) { if (rw.slen > 0) ++shared_nonempty; if (rw.blen > 0) ++baked_nonempty; if (rw.mdok) ++md_nonempty; }
-    {
-        char fm[300];
-        std::snprintf(fm, sizeof(fm),
-            "vertex-probe: parts=%d sharedNonEmpty=%d bakedNonEmpty=%d meshDataNonEmpty=%d sample='%s' verts=%d fail=%d %lu ms",
-            static_cast<int>(rows.size()), shared_nonempty, baked_nonempty, md_nonempty,
-            sample_name.c_str(), static_cast<int>(spts.size()), sfail,
-            static_cast<unsigned long>(GetTickCount() - t0));
-        Log(fm);
-    }
-
-    wchar_t local_app_data[MAX_PATH];
-    const DWORD got = GetEnvironmentVariableW(L"LOCALAPPDATA", local_app_data, MAX_PATH);
-    if (got == 0 || got >= MAX_PATH) return;
-    const std::wstring be_root = std::wstring(local_app_data) + L"\\BetterEndfield";
-    const std::wstring dir = be_root + L"\\scene-export";
-    CreateDirectoryW(be_root.c_str(), nullptr);
-    CreateDirectoryW(dir.c_str(), nullptr);
-    wchar_t path[MAX_PATH * 2];
-    swprintf_s(path, _countof(path), L"%ls\\chen_vertex_probe_%llu.txt", dir.c_str(),
-        static_cast<unsigned long long>(GetTickCount64()));
-    FILE* file = nullptr;
-    if (_wfopen_s(&file, path, L"w, ccs=UTF-8") != 0 || !file) {
-        Log("vertex-probe: open output file fail.");
-        return;
-    }
-    fwprintf(file, L"Chen vertex probe v0.7.3 (MeshData direct + BakeMesh cross-check)\nparts: %d\n",
-        static_cast<int>(rows.size()));
-    fwprintf(file, L"%-40ls %7s %7s %8s %7s %6s %9s %7s\n", L"part", L"shr_vc", L"shr_len", L"bake_len", L"md_vc", L"md_ok", L"readabl", L"visible");
-    for (auto& rw : rows) {
-        const std::wstring wn = Utf8ToWide(rw.name);
-        fwprintf(file, L"%-40ls %7d %7d %8d %7d %6s %9s %7s\n", wn.c_str(), rw.svc, rw.slen, rw.blen, rw.mdvc,
-            rw.mdok ? L"true" : L"false", rw.readable ? L"true" : L"false", rw.visible ? L"true" : L"false");
-    }
-    fwprintf(file, L"\nsampled part (MeshData preferred, else BakeMesh): %ls\n", Utf8ToWide(sample_name).c_str());
-    fwprintf(file, L"baked vertexCount: %d, read verts: %d, failed: %d\n",
-        sbvc, static_cast<int>(spts.size()), sfail);
-    fwprintf(file, L"AABB min: %.5f %.5f %.5f\nAABB max: %.5f %.5f %.5f\nsize: %.5f %.5f %.5f\n",
-        smn.x, smn.y, smn.z, smx.x, smx.y, smx.z, smx.x - smn.x, smx.y - smn.y, smx.z - smn.z);
-    fwprintf(file, L"--- first 5 vertices ---\n");
-    for (int i = 0; i < 5 && i < static_cast<int>(spts.size()); ++i)
-        fwprintf(file, L"[%d] %.5f %.5f %.5f\n", i, spts[i].x, spts[i].y, spts[i].z);
-    fwprintf(file, L"--- last 5 vertices ---\n");
-    int ls = static_cast<int>(spts.size()) - 5;
-    if (ls < 5) ls = 5;
-    for (int i = ls; i < static_cast<int>(spts.size()); ++i)
-        fwprintf(file, L"[%d] %.5f %.5f %.5f\n", i, spts[i].x, spts[i].y, spts[i].z);
-    fclose(file);
-    Log("vertex-probe FINISHED: chen_vertex_probe_*.txt written.");
+    if (g_gpu_parts.empty()) { Log("gpu-probe: no S_actor_chen_*_lod0 part is loaded."); return; }
+    g_gpu_wait = 0; g_gpu_start_tick = GetTickCount();
+    g_gpu_phase.store(1, std::memory_order_release);
+    char m[128]; std::snprintf(m, sizeof(m),
+        "gpu-probe START: %d Chen lod0 parts, vertexBufferTarget=Vertex|CopySource, waiting skin frames...",
+        (int)g_gpu_parts.size()); Log(m);
 }
 
+// Read back one not-yet-collected part. Returns 0 if its GPU buffer is not
+// ready this frame, 1 if the part is now collected (ok or definitive failure).
+int CollectOnePart(GpuPart& gp) {
+    MethodContract* get_vb = Contract("skinned.get_vb");
+    MethodContract* gb_count = Contract("gb.get_count");
+    MethodContract* gb_stride = Contract("gb.get_stride");
+    MethodContract* attr_count = Contract("mesh.attr_count");
+    MethodContract* get_attr = Contract("mesh.get_attr");
+    MethodContract* request = Contract("gpuread.request");
+    MethodContract* wait = Contract("gpr.wait");
+    MethodContract* haserr = Contract("gpr.has_error");
+    MethodContract* getraw = Contract("gpr.get_data_raw");
+    GpuPartResult& R = gp.pr;
+    R.name = gp.name; R.expect_vc = gp.expect_vc;
+
+    void* gb = Invoke(get_vb, gp.renderer, nullptr);
+    if (!gb) return 0; // SMR has not built the new-target buffer yet; retry next frame
+    R.got_buffer = true;
+    R.count = UnboxInt(Invoke(gb_count, gb, nullptr));
+    R.stride = UnboxInt(Invoke(gb_stride, gb, nullptr));
+
+    const int32_t nac = UnboxInt(Invoke(attr_count, gp.mesh, nullptr));
+    int acc = 0; char lay[320]{};
+    if (nac > 0 && nac < 32) {
+        for (int32_t ai = 0; ai < nac; ++ai) {
+            int32_t aix = ai; void* ap[1]{ &aix };
+            BE_VAD d{ -1,-1,-1,-1 }; bool df = false;
+            if (SafeUnbox(Invoke(get_attr, gp.mesh, ap), &d, sizeof(d), &df) && !df) {
+                char one[48]; std::snprintf(one, sizeof(one), "a%d(f%d,d%d,s%d) ",
+                    d.attribute, d.format, d.dimension, d.stream);
+                strncat_s(lay, one, _TRUNCATE);
+                if (d.attribute == 0 /*Position*/) { R.pos_off = acc; R.pos_fmt = d.format; R.pos_dim = d.dimension; }
+                acc += VertexFormatBytes(d.format) * (d.dimension > 0 ? d.dimension : 1);
+            }
+        }
+    }
+    R.layout = lay;
+
+    // A freshly-bound buffer may briefly report 0 / garbage count or stride. Treat an out-of-range
+    // value as "not ready" and retry on a later frame (bounded by the 12-frame budget) instead of
+    // permanently failing; human part meshes are well inside these sanity bounds.
+    const size_t probe_bytes = (R.count > 0 && R.stride > 0)
+        ? (size_t)R.count * (size_t)R.stride : 0;
+    if (R.count <= 0 || R.count > 1000000 || R.stride <= 0 || R.stride > 256 || probe_bytes > 67108864) {
+        char b[256]; std::snprintf(b, sizeof(b), "gpu-probe[%s] count/stride=%d/%d not ready, retry next frame",
+            gp.name.c_str(), R.count, R.stride); Log(b);
+        return 0;
+    }
+
+    // GetVertexBuffer returns a GraphicsBuffer; Request wants a ComputeBuffer. In THIS Unity build
+    // both are sealed classes of identical layout (SIZE 0x18, native handle m_Ptr @0x10) over the same
+    // underlying GfxBuffer, and il2cpp_runtime_invoke does no C# cast check, so passing the
+    // GraphicsBuffer object directly reaches the correct native buffer. Action callback stays null.
+    void* rq[2]{ gb, nullptr };
+    void* boxed_req = Invoke(request, nullptr /* static */, rq);
+    if (!boxed_req) { Log("gpu-probe: AsyncGPUReadback.Request returned null."); return 1; }
+    Invoke(wait, boxed_req, nullptr); // block until this readback finishes (same frame)
+    bool herr = false, he = false;
+    if (SafeUnbox(Invoke(haserr, boxed_req, nullptr), &herr, sizeof(herr), &he) && !he && herr) {
+        R.req_error = true; Log("gpu-probe: AsyncGPUReadback reported HasError."); return 1;
+    }
+    int32_t layer = 0; void* dp[1]{ &layer };
+    void* data = UnboxPtr(Invoke(getraw, boxed_req, dp));
+    if (!data) { Log("gpu-probe: GetDataRaw returned null."); return 1; }
+
+    const size_t bytes = (size_t)R.count * (size_t)R.stride;
+    std::vector<uint8_t> buf(bytes);
+    if (!SafeMemcpy(buf.data(), data, bytes)) { Log("gpu-probe: memcpy readback fault."); return 1; }
+
+    if (R.pos_fmt == 0 && R.pos_dim >= 3 && R.pos_off >= 0) {
+        bool first = true;
+        for (int32_t v = 0; v < R.count; ++v) {
+            const float* fp = reinterpret_cast<const float*>(
+                buf.data() + (size_t)v * R.stride + R.pos_off);
+            BE_Vec3 p{ fp[0], fp[1], fp[2] };
+            if (std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z)) {
+                ++R.n_finite;
+                if (first) { R.mn = R.mx = p; first = false; }
+                else {
+                    if (p.x < R.mn.x) R.mn.x = p.x; if (p.y < R.mn.y) R.mn.y = p.y; if (p.z < R.mn.z) R.mn.z = p.z;
+                    if (p.x > R.mx.x) R.mx.x = p.x; if (p.y > R.mx.y) R.mx.y = p.y; if (p.z > R.mx.z) R.mx.z = p.z;
+                }
+            }
+        }
+        R.ok = (R.n_finite == R.count);
+    }
+    char ob[320]; std::snprintf(ob, sizeof(ob),
+        "gpu-probe[%s] count=%d stride=%d pos(off=%d,fmt=%d,dim=%d) finite=%d/%d AABB %.3f %.3f %.3f ~ %.3f %.3f %.3f",
+        gp.name.c_str(), R.count, R.stride, R.pos_off, R.pos_fmt, R.pos_dim, R.n_finite, R.count,
+        R.mn.x, R.mn.y, R.mn.z, R.mx.x, R.mx.y, R.mx.z); Log(ob);
+    return 1;
+}
+
+void WriteGpuProbeFile(DWORD elapsed_ms) {
+    wchar_t local[MAX_PATH];
+    const DWORD got = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+    if (got == 0 || got >= MAX_PATH) return;
+    const std::wstring root = std::wstring(local) + L"\\BetterEndfield";
+    const std::wstring dir = root + L"\\scene-export";
+    CreateDirectoryW(root.c_str(), nullptr); CreateDirectoryW(dir.c_str(), nullptr);
+    wchar_t path[MAX_PATH * 2];
+    swprintf_s(path, _countof(path), L"%ls\\chen_gpu_vertex_%llu.txt", dir.c_str(),
+        static_cast<unsigned long long>(GetTickCount64()));
+    FILE* file = nullptr;
+    if (_wfopen_s(&file, path, L"w, ccs=UTF-8") != 0 || !file) { Log("gpu-probe: open output fail."); return; }
+    int okcnt = 0; for (auto& gp : g_gpu_parts) if (gp.pr.ok) ++okcnt;
+    fwprintf(file, L"Chen GPU skinned-vertex readback v0.7.4 (GetVertexBuffer + AsyncGPUReadback)\nparts: %d, ok: %d, %lu ms\n",
+        (int)g_gpu_parts.size(), okcnt, (unsigned long)elapsed_ms);
+    fwprintf(file, L"%-34ls %8s %8s %8s %8s %7s %7s\n",
+        L"part", L"expect", L"count", L"stride", L"finite", L"gotBuf", L"ok");
+    for (auto& gp : g_gpu_parts) {
+        const GpuPartResult& R = gp.pr; const std::wstring wn = Utf8ToWide(R.name);
+        fwprintf(file, L"%-34ls %8d %8d %8d %8d %7s %7s\n", wn.c_str(),
+            R.expect_vc, R.count, R.stride, R.n_finite,
+            R.got_buffer ? L"true" : L"false", R.ok ? L"true" : L"false");
+        fwprintf(file, L"    layout: %ls\n", Utf8ToWide(R.layout).c_str());
+        fwprintf(file, L"    AABB min %.5f %.5f %.5f  max %.5f %.5f %.5f  size %.5f %.5f %.5f\n",
+            R.mn.x, R.mn.y, R.mn.z, R.mx.x, R.mx.y, R.mx.z,
+            R.mx.x - R.mn.x, R.mx.y - R.mn.y, R.mx.z - R.mn.z);
+    }
+    fclose(file);
+    char m[200]; std::snprintf(m, sizeof(m),
+        "gpu-probe file written: %d/%d parts fully read back.", okcnt, (int)g_gpu_parts.size()); Log(m);
+}
+
+// Driven every frame by DetourPump. Wait >=3 frames for re-skinning, collect
+// each part, and finalize once all are ready or after a 12-frame budget.
+void TickGpuVertexReadback() {
+    if (g_gpu_phase.load(std::memory_order_acquire) != 1) return;
+    ++g_gpu_wait;
+    if (g_gpu_wait < 3) return;
+    for (auto& gp : g_gpu_parts) {
+        if (gp.collected) continue;
+        if (CollectOnePart(gp) == 1) gp.collected = true; // 0 = GPU buffer not ready, retry next frame
+    }
+    bool all = true;
+    for (auto& gp : g_gpu_parts) if (!gp.collected) { all = false; break; }
+    if (!all) {
+        if (g_gpu_wait < 12) return;
+        Log("gpu-probe: wait budget exhausted, finalize with whatever is ready.");
+    }
+    WriteGpuProbeFile(GetTickCount() - g_gpu_start_tick);
+    for (auto& gp : g_gpu_parts) {
+        if (gp.renderer_root) g_host->gchandle_free(g_host->context, gp.renderer_root);
+        if (gp.mesh_root) g_host->gchandle_free(g_host->context, gp.mesh_root);
+    }
+    g_gpu_parts.clear();
+    g_gpu_phase.store(0, std::memory_order_release);
+    Log("gpu-probe FINISHED, back to idle.");
+}
+
+
 void RunExportOnMainThread() {
-    ExportCameras();
-    ExportSkinnedMeshes();
-    ExportVertexProbe();
+    ExportCameras();        // sentinel: proves inject -> pump -> enumerate -> file pipeline is alive
+    ExportSkinnedMeshes();  // whole-scene SMR census for cross-check
+    StartGpuVertexReadback(); // stage 1 of the v0.7.4 cross-frame GPU readback
 }
 
 bool IsKeyDown(int virtual_key) {
@@ -794,6 +851,7 @@ void __fastcall DetourPump(void* instance, void* method) {
         g_export_request.exchange(false, std::memory_order_acq_rel)) {
         RunExportOnMainThread();
     }
+    TickGpuVertexReadback(); // advance the cross-frame GPU readback state machine every frame
 }
 
 bool ResolveContracts() {
@@ -819,7 +877,17 @@ bool ResolveContracts() {
                        Contract("mesh.ctor")->resolved &&
                        Contract("mesh.is_readable")->resolved &&
                        Contract("skinned.bake_mesh")->resolved &&
-                       Contract("renderer.is_visible")->resolved;
+                       Contract("renderer.is_visible")->resolved &&
+                       Contract("skinned.set_vbt")->resolved &&
+                       Contract("skinned.get_vb")->resolved &&
+                       Contract("gb.get_count")->resolved &&
+                       Contract("gb.get_stride")->resolved &&
+                       Contract("mesh.attr_count")->resolved &&
+                       Contract("mesh.get_attr")->resolved &&
+                       Contract("gpuread.request")->resolved &&
+                       Contract("gpr.wait")->resolved &&
+                       Contract("gpr.has_error")->resolved &&
+                       Contract("gpr.get_data_raw")->resolved;
     g_contracts_ready.store(ready, std::memory_order_release);
     return ready;
 }
@@ -893,7 +961,7 @@ BE_Result BE_CALL Initialize(const BE_HostApiV1* host) {
 
     g_input_stop.store(false, std::memory_order_release);
     g_input_thread = std::thread(InputThreadMain);
-    Log("Scene Exporter v0.7.3 ready (Cameras + SkinnedMesh + MeshData direct vertex channel + step diagnostics). Focus the game and press Ctrl+E.");
+    Log("Scene Exporter v0.7.4 ready (GPU skinned-vertex readback GetVertexBuffer+AsyncGPUReadback, cross-frame). Focus the game, stand Chen in front, press Ctrl+E.");
     return BE_Result_Ok;
 }
 
@@ -915,6 +983,14 @@ void BE_CALL Shutdown() {
             g_host->gchandle_free(g_host->context, g_skinned_type_root);
         }
     }
+    if (g_host && g_host->gchandle_free) {
+        for (auto& gp : g_gpu_parts) {
+            if (gp.renderer_root) g_host->gchandle_free(g_host->context, gp.renderer_root);
+            if (gp.mesh_root) g_host->gchandle_free(g_host->context, gp.mesh_root);
+        }
+    }
+    g_gpu_parts.clear();
+    g_gpu_phase.store(0);
     g_target_type_root = 0;
     g_target_type = nullptr;
     g_skinned_type_root = 0;
@@ -923,7 +999,7 @@ void BE_CALL Shutdown() {
 }
 
 const BE_ModuleApiV1 kApi{
-    {kModuleId, "Scene Exporter", "0.7.3", BETTER_ENDFIELD_MODULE_ABI_V1},
+    {kModuleId, "Scene Exporter", "0.7.4", BETTER_ENDFIELD_MODULE_ABI_V1},
     &Initialize, &ConfigurationChanged, &Shutdown};
 
 } // namespace
