@@ -1,4 +1,4 @@
-// BetterEndfield Scene Exporter — v0.7.5 (GPU skinned-vertex readback:
+// BetterEndfield Scene Exporter — v0.7.6 (GPU skinned-vertex readback:
 // SMR.set_vertexBufferTarget(Vertex|CopySource) -> wait frames -> SMR.GetVertexBuffer() current-frame
 // skinned GPU buffer -> AsyncGPUReadback.Request/WaitForCompletion/GetDataRaw -> parse Position.
 // This is the ONLY channel for isReadable=false GPU-resident skinned meshes; vertices/MeshData/BakeMesh
@@ -120,7 +120,7 @@ MethodContract g_contracts[]{
             "CopyAttributeIntoPtr",
             "System.IntPtr|UnityEngine.Rendering.VertexAttribute|UnityEngine.Rendering.VertexAttributeFormat|System.Int32|System.IntPtr",
             "System.Void", 5}},
-    // ===== v0.7.5 GPU skinned-vertex readback chain (RVAs verified against IL2CPP dump) =====
+    // ===== v0.7.6 GPU skinned-vertex readback chain (RVAs verified against IL2CPP dump) =====
     // Parameter-type strings are intentionally left null so the host matches by method name +
     // parameter count only (avoids exact-name pitfalls for nested enums / generic Action).
     // SMR.set_vertexBufferTarget(GraphicsBuffer.Target value type): request a CopySource-capable
@@ -155,7 +155,7 @@ MethodContract g_contracts[]{
     // AsyncGPUReadbackRequest is a sealed STRUCT (SIZE 0x20, m_Ptr@0x10). We use the STATIC _Injected
     // bindings and pass the UNBOXED struct pointer as the first by-ref argument. Passing the boxed
     // object crashes: the 0x10 object header overlaps the struct's m_Ptr slot, so the native side
-    // dereferences the monitor word (null) -> SEH. v0.7.5 fix.
+    // dereferences the monitor word (null) -> SEH. v0.7.6 fix.
     {"gpr.wait",
         {"UnityEngine.CoreModule.dll", "UnityEngine.Rendering", "AsyncGPUReadbackRequest",
             "WaitForCompletion_Injected", nullptr, "System.Void", 1}},
@@ -169,6 +169,32 @@ MethodContract g_contracts[]{
     {"sysinfo.supports_gpr",
         {"UnityEngine.CoreModule.dll", "UnityEngine", "SystemInfo",
             "SupportsAsyncGPUReadback", nullptr, "System.Boolean", 0}},
+    // ===== v0.7.6 diagnostics: Mesh per-stream source buffers, visibility, device identity =====
+    // Mesh.set_vertexBufferTarget(int): make the SOURCE (bind-pose) mesh GPU buffer CopySource-capable.
+    {"mesh.set_vbt",
+        {"UnityEngine.CoreModule.dll", "UnityEngine", "Mesh",
+            "set_vertexBufferTarget", nullptr, "System.Void", 1}},
+    // Mesh.GetVertexBuffer(int stream) -> GraphicsBuffer: one stream of the source mesh vertex layout.
+    {"mesh.get_vb_stream",
+        {"UnityEngine.CoreModule.dll", "UnityEngine", "Mesh",
+            "GetVertexBuffer", nullptr, "UnityEngine.GraphicsBuffer", 1}},
+    // Renderer.isVisible: whether the renderer passed frustum culling this frame.
+    {"renderer.get_visible",
+        {"UnityEngine.CoreModule.dll", "UnityEngine", "Renderer",
+            "get_isVisible", nullptr, "System.Boolean", 0}},
+    // GraphicsBuffer.target flags (int).
+    {"gb.get_target",
+        {"UnityEngine.CoreModule.dll", "UnityEngine", "GraphicsBuffer",
+            "get_target", nullptr, "System.Int32", 0}},
+    {"sysinfo.devtype",
+        {"UnityEngine.CoreModule.dll", "UnityEngine", "SystemInfo",
+            "GetGraphicsDeviceType", nullptr, nullptr, 0}},
+    {"sysinfo.devname",
+        {"UnityEngine.CoreModule.dll", "UnityEngine", "SystemInfo",
+            "GetGraphicsDeviceName", nullptr, "System.String", 0}},
+    {"sysinfo.supports_prop",
+        {"UnityEngine.CoreModule.dll", "UnityEngine", "SystemInfo",
+            "get_supportsAsyncGPUReadback", nullptr, "System.Boolean", 0}},
 };
 
 using PumpFn = void(__fastcall*)(void* instance, void* method);
@@ -191,7 +217,7 @@ std::atomic_bool g_input_stop{false};
 std::thread g_input_thread;
 std::atomic_bool g_contracts_ready{false};
 
-// v0.7.5 cross-frame GPU readback state (see TickGpuVertexReadback).
+// v0.7.6 cross-frame GPU readback state (see TickGpuVertexReadback).
 std::atomic_int g_gpu_phase{0}; // 0=idle, 1=waiting skin frames / reading back
 int g_gpu_wait = 0;
 DWORD g_gpu_start_tick = 0;
@@ -538,7 +564,7 @@ int32_t ArrayLengthOf(MethodContract* get_length, void* arr) {
 }
 
 // ===========================================================================
-// v0.7.5 GPU skinned-vertex readback — the only channel that works for
+// v0.7.6 GPU skinned-vertex readback — the only channel that works for
 // isReadable=false GPU-resident skinned meshes. Cross-frame state machine:
 //   Start (Ctrl+E frame): enumerate Chen lod0 parts, set vertexBufferTarget,
 //     pin renderer/mesh with GCHandle across frames;
@@ -557,7 +583,18 @@ struct GpuPartResult {
     bool got_buffer = false, req_error = false, ok = false;
     std::string layout;
     BE_Vec3 mn{0,0,0}, mx{0,0,0};
+    // v0.7.6 diagnostics
+    int32_t vis = -1;                                  // Renderer.isVisible
+    int32_t n_stream = 0;                              // distinct streams in the vertex layout
+    bool a_got = false; int32_t a_count = -1, a_stride = -1, a_target = -1; // path A: SMR.GetVertexBuffer()
+    int32_t b_got[3] = {0,0,0};                        // path B: Mesh.GetVertexBuffer(stream)
+    int32_t b_count[3] = {-1,-1,-1}, b_stride[3] = {-1,-1,-1}, b_target[3] = {-1,-1,-1};
+    bool breq_tried = false, breq_boxed = false, breq_haserr = false; void* breq_mptr = nullptr;
 };
+
+// v0.7.6 device identity, filled once at start.
+int32_t g_dev_type = -1; bool g_sup_method = false, g_sup_prop = false;
+std::string g_dev_name;
 
 struct GpuPart {
     uint32_t renderer_root = 0; void* renderer = nullptr;
@@ -624,11 +661,17 @@ void StartGpuVertexReadback() {
         Log("gpu-probe start skipped: base contracts not ready."); return;
     }
     if (sup->resolved) {
-        bool ok = false, ef = false;
-        if (SafeUnbox(Invoke(sup, nullptr, nullptr), &ok, sizeof(ok), &ef) && !ef) {
-            char b[96]; std::snprintf(b, sizeof(b),
-                "gpu-probe: SystemInfo.supportsAsyncGPUReadback=%d", (int)ok); Log(b);
-        }
+        bool ef = false;
+        SafeUnbox(Invoke(sup, nullptr, nullptr), &g_sup_method, sizeof(g_sup_method), &ef);
+        MethodContract* spp = Contract("sysinfo.supports_prop");
+        if (spp && spp->resolved) { bool v=false; SafeUnbox(Invoke(spp,nullptr,nullptr),&v,sizeof(v),&ef); g_sup_prop=v; }
+        MethodContract* dt = Contract("sysinfo.devtype");
+        if (dt && dt->resolved) g_dev_type = UnboxInt(Invoke(dt, nullptr, nullptr), -1);
+        MethodContract* dn = Contract("sysinfo.devname");
+        if (dn && dn->resolved) { char nb[160]{}; bool nf=false; if (SafeCopyName(Invoke(dn,nullptr,nullptr),nb,sizeof(nb),&nf)>0) g_dev_name=nb; }
+        char db[340]; std::snprintf(db, sizeof(db),
+            "gpu-probe DEVICE type=%d (2=D3D11 13=D3D12 15=Vulkan) name='%s' supportsAsync method=%d prop=%d",
+            g_dev_type, g_dev_name.c_str(), (int)g_sup_method, (int)g_sup_prop); Log(db);
     }
 
     void* fp[1]{ g_skinned_type };
@@ -654,11 +697,15 @@ void StartGpuVertexReadback() {
         if (!mesh) { char w[256]; std::snprintf(w, sizeof(w), "gpu-probe: %s has no sharedMesh, skip.", nb); Log(w); continue; }
         const int32_t vc = UnboxInt(Invoke(get_vcount, mesh, nullptr));
         int32_t target = kTarget; void* sp[1]{ &target }; // enum value type: pass by address
-        Invoke(set_vbt, r, sp);
+        Invoke(set_vbt, r, sp);                          // path A: SMR skinned-output target
+        MethodContract* mset = Contract("mesh.set_vbt");
+        if (mset && mset->resolved) Invoke(mset, mesh, sp); // path B: source mesh per-stream target
+        int32_t visv = -1; MethodContract* gvis = Contract("renderer.get_visible");
+        if (gvis && gvis->resolved) { bool vv=false,ef=false; if (SafeUnbox(Invoke(gvis,r,nullptr),&vv,sizeof(vv),&ef)&&!ef) visv=vv?1:0; }
         const uint32_t rr = g_host->gchandle_new(g_host->context, r, 0);
         const uint32_t mr = g_host->gchandle_new(g_host->context, mesh, 0);
         GpuPart gp; gp.renderer_root = rr; gp.renderer = r;
-        gp.mesh_root = mr; gp.mesh = mesh; gp.name = nb; gp.expect_vc = vc;
+        gp.mesh_root = mr; gp.mesh = mesh; gp.name = nb; gp.expect_vc = vc; gp.pr.vis = visv;
         g_gpu_parts.push_back(std::move(gp));
     }
     if (g_gpu_parts.empty()) { Log("gpu-probe: no S_actor_chen_*_lod0 part is loaded."); return; }
@@ -669,29 +716,31 @@ void StartGpuVertexReadback() {
         (int)g_gpu_parts.size()); Log(m);
 }
 
-// Read back one not-yet-collected part. Returns 0 if its GPU buffer is not
-// ready this frame, 1 if the part is now collected (ok or definitive failure).
+// v0.7.6 DIAGNOSTIC collector. Compare path A (SMR skinned-output buffer) against path B
+// (sharedMesh per-stream bind-pose buffers), record visibility, and probe whether an
+// AsyncGPUReadback request can even be created. Returns 0 while path-B stream0 is not ready.
 int CollectOnePart(GpuPart& gp) {
     MethodContract* get_vb = Contract("skinned.get_vb");
     MethodContract* gb_count = Contract("gb.get_count");
     MethodContract* gb_stride = Contract("gb.get_stride");
+    MethodContract* gb_target = Contract("gb.get_target");
     MethodContract* attr_count = Contract("mesh.attr_count");
     MethodContract* get_attr = Contract("mesh.get_attr");
+    MethodContract* mesh_vb = Contract("mesh.get_vb_stream");
     MethodContract* request = Contract("gpuread.request");
-    MethodContract* wait = Contract("gpr.wait");
     MethodContract* haserr = Contract("gpr.has_error");
-    MethodContract* getraw = Contract("gpr.get_data_raw");
     GpuPartResult& R = gp.pr;
     R.name = gp.name; R.expect_vc = gp.expect_vc;
 
-    void* gb = Invoke(get_vb, gp.renderer, nullptr);
-    if (!gb) return 0; // SMR has not built the new-target buffer yet; retry next frame
-    R.got_buffer = true;
-    R.count = UnboxInt(Invoke(gb_count, gb, nullptr));
-    R.stride = UnboxInt(Invoke(gb_stride, gb, nullptr));
+    auto GbDesc = [&](void* gb, int32_t& c, int32_t& st, int32_t& tg) {
+        c = UnboxInt(Invoke(gb_count, gb, nullptr));
+        st = UnboxInt(Invoke(gb_stride, gb, nullptr));
+        if (gb_target && gb_target->resolved) tg = UnboxInt(Invoke(gb_target, gb, nullptr));
+    };
 
+    // Vertex layout + number of distinct streams (from sharedMesh).
     const int32_t nac = UnboxInt(Invoke(attr_count, gp.mesh, nullptr));
-    int acc = 0; char lay[320]{};
+    int maxStream = -1; char lay[320]{};
     if (nac > 0 && nac < 32) {
         for (int32_t ai = 0; ai < nac; ++ai) {
             int32_t aix = ai; void* ap[1]{ &aix };
@@ -700,80 +749,55 @@ int CollectOnePart(GpuPart& gp) {
                 char one[48]; std::snprintf(one, sizeof(one), "a%d(f%d,d%d,s%d) ",
                     d.attribute, d.format, d.dimension, d.stream);
                 strncat_s(lay, one, _TRUNCATE);
-                if (d.attribute == 0 /*Position*/) { R.pos_off = acc; R.pos_fmt = d.format; R.pos_dim = d.dimension; }
-                acc += VertexFormatBytes(d.format) * (d.dimension > 0 ? d.dimension : 1);
+                if (d.stream > maxStream) maxStream = d.stream;
             }
         }
     }
     R.layout = lay;
+    R.n_stream = maxStream + 1; if (R.n_stream < 1) R.n_stream = 1; if (R.n_stream > 3) R.n_stream = 3;
 
-    // A freshly-bound buffer may briefly report 0 / garbage count or stride. Treat an out-of-range
-    // value as "not ready" and retry on a later frame (bounded by the 12-frame budget) instead of
-    // permanently failing; human part meshes are well inside these sanity bounds.
-    const size_t probe_bytes = (R.count > 0 && R.stride > 0)
-        ? (size_t)R.count * (size_t)R.stride : 0;
-    // Ready only when sane AND the element count equals the shared mesh vertex count: while the
-    // SMR is rebuilding its CopySource buffer the getter may briefly return a stale/garbage count
-    // (observed 262144), so keep retrying until it lines up with the known vertexCount.
-    const bool count_matches = (R.count == gp.expect_vc);
-    if (R.count <= 0 || R.count > 1000000 || R.stride <= 0 || R.stride > 256 ||
-        probe_bytes > 67108864 || !count_matches) {
-        char b[256]; std::snprintf(b, sizeof(b),
-            "gpu-probe[%s] count/stride=%d/%d expect=%d not ready, retry next frame",
-            gp.name.c_str(), R.count, R.stride, gp.expect_vc); Log(b);
-        return 0;
+    // Path A: SMR no-arg skinned-output buffer.
+    void* agb = Invoke(get_vb, gp.renderer, nullptr);
+    if (agb) { R.a_got = true; GbDesc(agb, R.a_count, R.a_stride, R.a_target); }
+
+    // Path B: sharedMesh per-stream source (bind-pose) buffers.
+    bool b0 = false;
+    if (mesh_vb && mesh_vb->resolved) {
+        for (int s = 0; s < R.n_stream; ++s) {
+            int32_t si = s; void* bp[1]{ &si };
+            void* bgb = Invoke(mesh_vb, gp.mesh, bp);
+            if (bgb) { R.b_got[s] = 1; GbDesc(bgb, R.b_count[s], R.b_stride[s], R.b_target[s]); if (s == 0) b0 = true; }
+        }
     }
+    if (!b0) return 0; // source GPU buffer still rebuilding -> retry next frame
 
-    // GetVertexBuffer returns a GraphicsBuffer; Request wants a ComputeBuffer. In THIS Unity build
-    // both are sealed classes of identical layout (SIZE 0x18, native handle m_Ptr @0x10) over the same
-    // underlying GfxBuffer, and il2cpp_runtime_invoke does no C# cast check, so passing the
-    // GraphicsBuffer object directly reaches the correct native buffer. Action callback stays null.
-    void* rq[2]{ gb, nullptr };
-    void* boxed_req = Invoke(request, nullptr /* static */, rq);
-    if (!boxed_req) { Log("gpu-probe: AsyncGPUReadback.Request returned null."); return 1; }
-    // AsyncGPUReadbackRequest is a struct: static _Injected bindings want the unboxed data pointer.
-    void* req = UnboxThis(boxed_req);
-    if (!req) { Log("gpu-probe: request unbox returned null."); return 1; }
-    void* native_req = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(req) + 0x10); // m_Ptr@0x10
-    {
-        char pb[220]; std::snprintf(pb, sizeof(pb),
-            "gpu-probe[%s] Request ok req=%p m_Ptr=%p", gp.name.c_str(), req, native_req); Log(pb);
-    }
-    void* sp[1]{ req }; // by-ref self for the _Injected static methods
-    Invoke(wait, nullptr, sp); // block until this readback finishes
-    bool herr = false, he = false;
-    if (SafeUnbox(Invoke(haserr, nullptr, sp), &herr, sizeof(herr), &he) && !he && herr) {
-        R.req_error = true; Log("gpu-probe: AsyncGPUReadback reported HasError."); return 1;
-    }
-    int32_t layer = 0; void* dp[2]{ req, &layer };
-    void* data = UnboxPtr(Invoke(getraw, nullptr, dp));
-    if (!data) { Log("gpu-probe: GetDataRaw returned null."); return 1; }
-
-    const size_t bytes = (size_t)R.count * (size_t)R.stride;
-    std::vector<uint8_t> buf(bytes);
-    if (!SafeMemcpy(buf.data(), data, bytes)) { Log("gpu-probe: memcpy readback fault."); return 1; }
-
-    if (R.pos_fmt == 0 && R.pos_dim >= 3 && R.pos_off >= 0) {
-        bool first = true;
-        for (int32_t v = 0; v < R.count; ++v) {
-            const float* fp = reinterpret_cast<const float*>(
-                buf.data() + (size_t)v * R.stride + R.pos_off);
-            BE_Vec3 p{ fp[0], fp[1], fp[2] };
-            if (std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z)) {
-                ++R.n_finite;
-                if (first) { R.mn = R.mx = p; first = false; }
-                else {
-                    if (p.x < R.mn.x) R.mn.x = p.x; if (p.y < R.mn.y) R.mn.y = p.y; if (p.z < R.mn.z) R.mn.z = p.z;
-                    if (p.x > R.mx.x) R.mx.x = p.x; if (p.y > R.mx.y) R.mx.y = p.y; if (p.z > R.mx.z) R.mx.z = p.z;
+    // Probe: can an AsyncGPUReadback request be created on path-B stream0? (create only, no wait)
+    if (!R.breq_tried && request && request->resolved) {
+        R.breq_tried = true;
+        int32_t z = 0; void* bp0[1]{ &z };
+        void* b0gb = Invoke(mesh_vb, gp.mesh, bp0);
+        if (b0gb) {
+            void* rq[2]{ b0gb, nullptr };
+            void* boxed = Invoke(request, nullptr, rq);
+            if (boxed) {
+                R.breq_boxed = true;
+                void* req = UnboxThis(boxed);
+                if (req) {
+                    R.breq_mptr = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(req) + 0x10);
+                    void* sp[1]{ req }; bool he = false, ef = false;
+                    if (SafeUnbox(Invoke(haserr, nullptr, sp), &he, sizeof(he), &ef) && !ef) R.breq_haserr = he;
                 }
             }
         }
-        R.ok = (R.n_finite == R.count);
     }
-    char ob[320]; std::snprintf(ob, sizeof(ob),
-        "gpu-probe[%s] count=%d stride=%d pos(off=%d,fmt=%d,dim=%d) finite=%d/%d AABB %.3f %.3f %.3f ~ %.3f %.3f %.3f",
-        gp.name.c_str(), R.count, R.stride, R.pos_off, R.pos_fmt, R.pos_dim, R.n_finite, R.count,
-        R.mn.x, R.mn.y, R.mn.z, R.mx.x, R.mx.y, R.mx.z); Log(ob);
+
+    char ob[420]; std::snprintf(ob, sizeof(ob),
+        "diag[%s] vis=%d A(got=%d c=%d st=%d tg=%d) streams=%d B0(c=%d st=%d tg=%d) B1(c=%d st=%d) B2(c=%d st=%d) req(box=%d mptr=%p err=%d)",
+        gp.name.c_str(), R.vis, (int)R.a_got, R.a_count, R.a_stride, R.a_target, R.n_stream,
+        R.b_count[0], R.b_stride[0], R.b_target[0], R.b_count[1], R.b_stride[1], R.b_count[2], R.b_stride[2],
+        (int)R.breq_boxed, R.breq_mptr, (int)R.breq_haserr);
+    Log(ob);
+    R.ok = true;
     return 1;
 }
 
@@ -785,28 +809,29 @@ void WriteGpuProbeFile(DWORD elapsed_ms) {
     const std::wstring dir = root + L"\\scene-export";
     CreateDirectoryW(root.c_str(), nullptr); CreateDirectoryW(dir.c_str(), nullptr);
     wchar_t path[MAX_PATH * 2];
-    swprintf_s(path, _countof(path), L"%ls\\chen_gpu_vertex_%llu.txt", dir.c_str(),
+    swprintf_s(path, _countof(path), L"%ls\\chen_diag_%llu.txt", dir.c_str(),
         static_cast<unsigned long long>(GetTickCount64()));
     FILE* file = nullptr;
-    if (_wfopen_s(&file, path, L"w, ccs=UTF-8") != 0 || !file) { Log("gpu-probe: open output fail."); return; }
-    int okcnt = 0; for (auto& gp : g_gpu_parts) if (gp.pr.ok) ++okcnt;
-    fwprintf(file, L"Chen GPU skinned-vertex readback v0.7.5 (GetVertexBuffer + AsyncGPUReadback)\nparts: %d, ok: %d, %lu ms\n",
-        (int)g_gpu_parts.size(), okcnt, (unsigned long)elapsed_ms);
-    fwprintf(file, L"%-34ls %8s %8s %8s %8s %7s %7s\n",
-        L"part", L"expect", L"count", L"stride", L"finite", L"gotBuf", L"ok");
+    if (_wfopen_s(&file, path, L"w, ccs=UTF-8") != 0 || !file) { Log("diag: open output fail."); return; }
+    fwprintf(file, L"Chen vertex-buffer DIAGNOSTIC v0.7.6   %lu ms\n", (unsigned long)elapsed_ms);
+    fwprintf(file, L"DEVICE type=%d name='%ls' supportsAsyncGPUReadback method=%d prop=%d\n",
+        g_dev_type, Utf8ToWide(g_dev_name).c_str(), (int)g_sup_method, (int)g_sup_prop);
+    fwprintf(file, L"(GraphicsDeviceType: 2=D3D11  13=D3D12  15=Vulkan)\n\n");
     for (auto& gp : g_gpu_parts) {
         const GpuPartResult& R = gp.pr; const std::wstring wn = Utf8ToWide(R.name);
-        fwprintf(file, L"%-34ls %8d %8d %8d %8d %7s %7s\n", wn.c_str(),
-            R.expect_vc, R.count, R.stride, R.n_finite,
-            R.got_buffer ? L"true" : L"false", R.ok ? L"true" : L"false");
-        fwprintf(file, L"    layout: %ls\n", Utf8ToWide(R.layout).c_str());
-        fwprintf(file, L"    AABB min %.5f %.5f %.5f  max %.5f %.5f %.5f  size %.5f %.5f %.5f\n",
-            R.mn.x, R.mn.y, R.mn.z, R.mx.x, R.mx.y, R.mx.z,
-            R.mx.x - R.mn.x, R.mx.y - R.mn.y, R.mx.z - R.mn.z);
+        fwprintf(file, L"== %ls == expect_vc=%d isVisible=%d streams=%d\n",
+            wn.c_str(), R.expect_vc, R.vis, R.n_stream);
+        fwprintf(file, L"   A SMR.GetVertexBuffer()   : got=%d count=%d stride=%d target=%d\n",
+            (int)R.a_got, R.a_count, R.a_stride, R.a_target);
+        for (int s = 0; s < R.n_stream; ++s)
+            fwprintf(file, L"   B Mesh.GetVertexBuffer(%d) : got=%d count=%d stride=%d target=%d\n",
+                s, R.b_got[s], R.b_count[s], R.b_stride[s], R.b_target[s]);
+        fwprintf(file, L"   asyncReq on B0: boxed=%d m_Ptr=%p hasError=%d\n",
+            (int)R.breq_boxed, (void*)R.breq_mptr, (int)R.breq_haserr);
+        fwprintf(file, L"   layout: %ls\n\n", Utf8ToWide(R.layout).c_str());
     }
     fclose(file);
-    char m[200]; std::snprintf(m, sizeof(m),
-        "gpu-probe file written: %d/%d parts fully read back.", okcnt, (int)g_gpu_parts.size()); Log(m);
+    Log("diag file written: chen_diag_*.txt");
 }
 
 // Driven every frame by DetourPump. Wait >=3 frames for re-skinning, collect
@@ -839,7 +864,7 @@ void TickGpuVertexReadback() {
 void RunExportOnMainThread() {
     ExportCameras();        // sentinel: proves inject -> pump -> enumerate -> file pipeline is alive
     ExportSkinnedMeshes();  // whole-scene SMR census for cross-check
-    StartGpuVertexReadback(); // stage 1 of the v0.7.5 cross-frame GPU readback
+    StartGpuVertexReadback(); // stage 1 of the v0.7.6 cross-frame GPU readback
 }
 
 bool IsKeyDown(int virtual_key) {
@@ -986,7 +1011,7 @@ BE_Result BE_CALL Initialize(const BE_HostApiV1* host) {
 
     g_input_stop.store(false, std::memory_order_release);
     g_input_thread = std::thread(InputThreadMain);
-    Log("Scene Exporter v0.7.5 ready (GPU skinned-vertex readback GetVertexBuffer+AsyncGPUReadback, cross-frame). Focus the game, stand Chen in front, press Ctrl+E.");
+    Log("Scene Exporter v0.7.6 ready (GPU skinned-vertex readback GetVertexBuffer+AsyncGPUReadback, cross-frame). Focus the game, stand Chen in front, press Ctrl+E.");
     return BE_Result_Ok;
 }
 
@@ -1024,7 +1049,7 @@ void BE_CALL Shutdown() {
 }
 
 const BE_ModuleApiV1 kApi{
-    {kModuleId, "Scene Exporter", "0.7.5", BETTER_ENDFIELD_MODULE_ABI_V1},
+    {kModuleId, "Scene Exporter", "0.7.6", BETTER_ENDFIELD_MODULE_ABI_V1},
     &Initialize, &ConfigurationChanged, &Shutdown};
 
 } // namespace
