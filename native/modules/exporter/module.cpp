@@ -1,4 +1,4 @@
-// BetterEndfield Scene Exporter — v0.8.0 (official Unity GPU-skinning readback: set CopySource flag once, wait 12 frames, read, restore flag; see TickGpuVertexReadback):
+// BetterEndfield Scene Exporter — v0.9.0 (read-only bind-pose static mesh vertex readback: Mesh.GetVertexBuffer(0) -> Graphics.CopyBuffer into our CopySource|CopyDestination staging GraphicsBuffer -> AsyncGPUReadback; no game buffer target is mutated; see TickGpuVertexReadback):
 // *** NEVER call set_vertexBufferTarget on game meshes/renderers *** — v0.7.4~v0.7.8 did, and it
 // tore down+rebuilt GPU-resident vertex buffers with no CPU copy, so hair/body/clothes vanished
 // on screen right after Ctrl+E (only CPU-backed face/eyebrow/cloth_03 survived). Confirmed by user:
@@ -187,6 +187,15 @@ MethodContract g_contracts[]{
     {"gb.get_target",
         {"UnityEngine.CoreModule.dll", "UnityEngine", "GraphicsBuffer",
             "get_target", nullptr, "System.Int32", 0}},
+    {"gb.ctor",
+        {"UnityEngine.CoreModule.dll", "UnityEngine", "GraphicsBuffer",
+            ".ctor", nullptr, "System.Void", 3}},
+    {"gb.release",
+        {"UnityEngine.CoreModule.dll", "UnityEngine", "GraphicsBuffer",
+            "Release", nullptr, "System.Void", 0}},
+    {"graphics.copy_buffer",
+        {"UnityEngine.CoreModule.dll", "UnityEngine", "Graphics",
+            "CopyBuffer", "UnityEngine.GraphicsBuffer|UnityEngine.GraphicsBuffer", "System.Void", 2}},
     {"sysinfo.devtype",
         {"UnityEngine.CoreModule.dll", "UnityEngine", "SystemInfo",
             "GetGraphicsDeviceType", nullptr, nullptr, 0}},
@@ -211,6 +220,7 @@ uint32_t g_skinned_type_root = 0;
 void* g_mesh_class_info = nullptr;
 // v0.7.0：UnityEngine.Mesh.MeshDataArray 嵌套类信息（object_new 装箱后调 .ctor 拿只读网格数据）。
 void* g_mda_class_info = nullptr;
+void* g_gb_class_info = nullptr; // v0.9.0 UnityEngine.GraphicsBuffer class_info for object_new (staging buffer)
 
 std::atomic_bool g_export_request{false};
 std::atomic_int g_hotkey{VK_F9};
@@ -592,6 +602,15 @@ struct GpuPartResult {
     int32_t b_got[3] = {0,0,0};                        // path B: Mesh.GetVertexBuffer(stream)
     int32_t b_count[3] = {-1,-1,-1}, b_stride[3] = {-1,-1,-1}, b_target[3] = {-1,-1,-1};
     bool breq_tried = false, breq_boxed = false, breq_haserr = false; void* breq_mptr = nullptr;
+    // v0.9.0 PATH M (correct route): source Mesh.GetVertexBuffer(0) = bind-pose STATIC GPU buffer
+    // (persistent since load, unlike SMR current-frame). Relay it through our OWN staging GraphicsBuffer
+    // via Graphics.CopyBuffer, then AsyncGPUReadback the staging buffer. We never mutate game targets.
+    int32_t m_readable = -1;                            // Mesh.isReadable (expected false)
+    bool m_src_got = false; int32_t m_count=-1, m_stride=-1, m_target=-1; // static source buffer desc
+    bool m_stage_built = false, m_copy_ok = false, m_req_haserr = false;  // staging built / copy ok / readback err
+    int32_t m_finite = 0;                               // finite bind-pose positions decoded
+    BE_Vec3 mmn{0,0,0}, mmx{0,0,0};                     // bind-pose Position AABB
+    std::string mraw;                                   // first bytes of the relayed static buffer
 };
 
 // v0.7.8 device identity, filled once at start.
@@ -610,6 +629,8 @@ struct GpuPart {
     bool requested = false;
     uint32_t b0gb_root = 0;     void* b0gb = nullptr;
     uint32_t req_root = 0;      void* req_boxed = nullptr;
+    uint32_t msrc_root = 0;     void* m_src = nullptr;    // v0.9.0 pinned static source GraphicsBuffer
+    uint32_t mstage_root = 0;   void* m_stage = nullptr;  // v0.9.0 our staging buffer (Release() after)
     GpuPartResult pr;
 };
 
@@ -662,7 +683,7 @@ void StartGpuVertexReadback() {
     MethodContract* get_mesh = Contract("skinned.get_shared_mesh");
     MethodContract* get_vcount = Contract("mesh.get_vertex_count");
     MethodContract* get_vb0 = Contract("skinned.get_vb");
-    MethodContract* set_vbt0 = Contract("skinned.set_vbt");
+    // (v0.9.0) skinned.set_vbt intentionally NOT used: setting target on isReadable=false parts empties them.
     MethodContract* sup = Contract("sysinfo.supports_gpr");
     if (!g_skinned_type || !find_all->resolved || !get_name->resolved ||
         !get_length->resolved || !get_value->resolved || !get_mesh->resolved ||
@@ -705,23 +726,24 @@ void StartGpuVertexReadback() {
         void* mesh = Invoke(get_mesh, r, nullptr);
         if (!mesh) { char w[256]; std::snprintf(w, sizeof(w), "gpu-probe: %s has no sharedMesh, skip.", nb); Log(w); continue; }
         const int32_t vc = UnboxInt(Invoke(get_vcount, mesh, nullptr));
-        // v0.8.0: set usage flag Vertex(1)|CopySource(4)=5 ONCE here; the engine rebuilds+re-skins the
-        // GPU vertex buffer over the next >=12 frames in Tick, so reading later never catches it mid-rebuild.
-        if (set_vbt0 && set_vbt0->resolved) { int32_t usage = 5; void* tp[1]{ &usage }; Invoke(set_vbt0, r, tp); }
-        // (v0.8.0) flag set once above, restored to Vertex=1 when the pass finishes.
+        // v0.9.0: never mutate a buffer target (with isReadable=false that rebuilds an EMPTY buffer).
+        // Just record Mesh.isReadable below for the diagnosis; the static GPU buffer is read via CopyBuffer relay.
+        int32_t readable = -1; { MethodContract* mread = Contract("mesh.is_readable");
+            if (mread && mread->resolved) { bool rv=false,ef=false; if (SafeUnbox(Invoke(mread,mesh,nullptr),&rv,sizeof(rv),&ef)&&!ef) readable=rv?1:0; } }
+        // (v0.9.0) nothing is mutated, so Tick has no restore step.
         int32_t visv = -1; MethodContract* gvis = Contract("renderer.is_visible");
         if (gvis && gvis->resolved) { bool vv=false,ef=false; if (SafeUnbox(Invoke(gvis,r,nullptr),&vv,sizeof(vv),&ef)&&!ef) visv=vv?1:0; }
         const uint32_t rr = g_host->gchandle_new(g_host->context, r, 0);
         const uint32_t mr = g_host->gchandle_new(g_host->context, mesh, 0);
         GpuPart gp; gp.renderer_root = rr; gp.renderer = r;
-        gp.mesh_root = mr; gp.mesh = mesh; gp.name = nb; gp.expect_vc = vc; gp.pr.vis = visv;
+        gp.mesh_root = mr; gp.mesh = mesh; gp.name = nb; gp.expect_vc = vc; gp.pr.vis = visv; gp.pr.m_readable = readable;
         g_gpu_parts.push_back(std::move(gp));
     }
     if (g_gpu_parts.empty()) { Log("gpu-probe: no S_actor_chen_*_lod0 part is loaded."); return; }
     g_gpu_wait = 0; g_gpu_start_tick = GetTickCount();
     g_gpu_phase.store(1, std::memory_order_release);
     char m[220]; std::snprintf(m, sizeof(m),
-        "gpu-probe START v0.8.0: %d Chen lod0 parts; set vertexBufferTarget=Vertex|CopySource once, wait 12 frames, then read current-frame SMR buffer.",
+        "gpu-probe START v0.9.0: %d Chen lod0 parts; READ-ONLY path M = Mesh.GetVertexBuffer(0) static bind-pose buffer -> Graphics.CopyBuffer into our staging -> AsyncGPUReadback; path A (SMR current-frame) recorded as control only.",
         (int)g_gpu_parts.size()); Log(m);
 }
 
@@ -768,37 +790,58 @@ int CollectOnePart(GpuPart& gp) {
         R.layout = lay;
         R.n_stream = maxStream + 1; if (R.n_stream < 1) R.n_stream = 1; if (R.n_stream > 3) R.n_stream = 3;
 
-        // v0.7.9 PATH A ONLY (read-only): SMR.GetVertexBuffer() = current-frame already-skinned GPU
-        // buffer the engine built to DRAW this part. No target mutation -> character stays intact.
+        // PATH A (control only): SMR current-frame skinned buffer. Just record whether it exists; do NOT
+        // read it (Vulkan GPU-skinning leaves it null for the 8 big parts even after set_vertexBufferTarget).
         void* agb = Invoke(get_vb, gp.renderer, nullptr);
-        if (agb) {
-            R.a_got = true;
-            GbDesc(agb, R.a_count, R.a_stride, R.a_target);
-            R.got_buffer = true;
-            gp.b0gb = agb;                 // reuse existing async-readback plumbing (pin/request/poll)
-            R.count = R.a_count; R.stride = R.a_stride;
+        if (agb) { R.a_got = true; GbDesc(agb, R.a_count, R.a_stride, R.a_target); }
+
+        // PATH M (route under test): Mesh.GetVertexBuffer(0) = bind-pose STATIC GPU buffer, persistent
+        // since load. It is Vertex-only (target=1), which AsyncGPUReadback rejects directly, so we build our
+        // OWN staging GraphicsBuffer (CopySource|CopyDestination) and Graphics.CopyBuffer the static bytes
+        // into it on the GPU, then async-read the staging buffer. No game buffer target is ever changed.
+        MethodContract* mget = Contract("mesh.get_vb_stream");
+        MethodContract* gbctor = Contract("gb.ctor");
+        MethodContract* gbrel = Contract("gb.release");
+        MethodContract* copyb = Contract("graphics.copy_buffer");
+        if (!mget || !mget->resolved || !gbctor || !gbctor->resolved || !g_gb_class_info ||
+            !copyb || !copyb->resolved || !request || !request->resolved) {
+            R.req_error = true; Log("gpu-probe: path M contracts/class not ready."); return 1;
         }
-        if (!agb) { ++gp.miss; return 0; } // current-frame buffer absent (part not drawn) -> retry
-        if (gp.expect_vc > 0 && R.count > gp.expect_vc * 4) R.count = gp.expect_vc * 4;
-        if (R.stride <= 0 || R.stride > 1024) { R.req_error = true; Log("gpu-probe: path A bad stride."); return 1; }
-
-        // v0.7.9: path B (Mesh.GetVertexBuffer per-stream) removed below; path A is sole source.
-
-        if (!request || !request->resolved) { R.req_error = true; return 1; }
-        void* rq[2]{ gp.b0gb, nullptr };
-        void* boxed = Invoke(request, nullptr, rq);
-        if (!boxed) { R.req_error = true; Log("gpu-probe: pathA Request returned null (buffer may lack CopySource target)."); return 1; }
-        gp.req_boxed = boxed;
-        gp.req_root = g_host->gchandle_new(g_host->context, boxed, 0);
-        gp.b0gb_root = g_host->gchandle_new(g_host->context, gp.b0gb, 0);
+        int32_t stream0 = 0; void* sp0[1]{ &stream0 };
+        void* src = Invoke(mget, gp.mesh, sp0);
+        if (!src) { ++gp.miss; return 0; } // static buffer momentarily unavailable -> retry next frames
+        R.m_src_got = true;
+        GbDesc(src, R.m_count, R.m_stride, R.m_target);
+        if (R.m_count <= 0 || R.m_stride <= 0 || R.m_stride > 1024) {
+            char w[200]; std::snprintf(w, sizeof(w), "gpu-probe[%s] path M bad static desc c=%d st=%d.",
+                gp.name.c_str(), R.m_count, R.m_stride); Log(w); return 1;
+        }
+        // Construct the staging buffer: CopySource(4)|CopyDestination(8)=12, same count/stride as source.
+        void* stage = g_host->object_new(g_host->context, g_gb_class_info);
+        if (!stage) { R.req_error = true; Log("gpu-probe: object_new GraphicsBuffer failed."); return 1; }
+        { int32_t usage = 12, cnt = R.m_count, sst = R.m_stride; void* cp[3]{ &usage, &cnt, &sst };
+          Invoke(gbctor, stage, cp); }
+        { void* cpar[2]{ src, stage }; Invoke(copyb, nullptr, cpar); } // GPU-side src -> stage
+        R.m_stage_built = true; R.m_copy_ok = true;
+        { void* rq[2]{ stage, nullptr }; void* boxed = Invoke(request, nullptr, rq);
+          if (!boxed) {
+              R.m_req_haserr = true;
+              if (gbrel && gbrel->resolved) Invoke(gbrel, stage, nullptr);
+              Log("gpu-probe: path M staging Request returned null."); return 1;
+          }
+          gp.m_src = src; gp.m_stage = stage; gp.req_boxed = boxed;
+          gp.msrc_root = g_host->gchandle_new(g_host->context, src, 0);
+          gp.mstage_root = g_host->gchandle_new(g_host->context, stage, 0);
+          gp.req_root = g_host->gchandle_new(g_host->context, boxed, 0);
+        }
         gp.requested = true;
-        char sb[220]; std::snprintf(sb, sizeof(sb),
-            "gpu-probe[%s] pathA request sent count=%d stride=%d target=%d (expect_vc=%d)",
-            gp.name.c_str(), R.count, R.stride, R.a_target, gp.expect_vc); Log(sb);
+        char sb[280]; std::snprintf(sb, sizeof(sb),
+            "gpu-probe[%s] pathM static c=%d st=%d tg=%d readable=%d (control A got=%d); CopyBuffer+request sent.",
+            gp.name.c_str(), R.m_count, R.m_stride, R.m_target, R.m_readable, (int)R.a_got); Log(sb);
         return 0; // let the GPU readback finish over the next frames
     }
 
-    // ---------- phase 2: poll the request, then copy stream0 and parse Position ----------
+    // ---------- phase 2: poll the M-path request, copy bytes, decode bind-pose Position ----------
     void* req = UnboxThis(gp.req_boxed);
     if (!req) { R.req_error = true; return 1; }
     void* sp[1]{ req };
@@ -807,47 +850,41 @@ int CollectOnePart(GpuPart& gp) {
     if (!done) return 0;
     bool herr = false;
     if (SafeUnbox(Invoke(haserr, nullptr, sp), &herr, sizeof(herr), &ef) && !ef && herr) {
-        R.req_error = true; Log("gpu-probe: pathA readback HasError."); return 1;
+        R.m_req_haserr = true; Log("gpu-probe: path M staging readback HasError."); return 1;
     }
     int32_t layer = 0; void* dp[2]{ req, &layer };
     void* data = UnboxPtr(Invoke(getraw, nullptr, dp));
-    if (!data) { Log("gpu-probe: pathA GetDataRaw null."); return 1; }
+    if (!data) { Log("gpu-probe: path M GetDataRaw null."); return 1; }
 
-    // GPU buffer count is padded up to alignment (observed +1..3 over vertexCount); trim to vertexCount.
-    int32_t take = R.count;
+    // Whole static stream0 = count*stride; trim to vertexCount and cap defensively.
+    int32_t take = R.m_count;
     if (gp.expect_vc > 0 && take > gp.expect_vc) take = gp.expect_vc;
-    // v0.8.0: the reported stride understates the real interleaved size (measured face: real 60 vs reported 16).
-    // Pull up to expect_vc*128 bytes (capped at the whole GPU buffer) so RAW96 covers several real vertices;
-    // the Position AABB loop below still walks by the reported stride as a cross-check only.
-    size_t whole08 = (R.a_count > 0 && R.a_stride > 0) ? (size_t)R.a_count * (size_t)R.a_stride : 0;
-    size_t want08 = (gp.expect_vc > 0) ? (size_t)gp.expect_vc * 128 : (size_t)take * (size_t)R.stride;
-    size_t bytes = want08; if (whole08 > 0 && bytes > whole08) bytes = whole08; if (bytes < 64) bytes = (whole08 >= 64) ? 64 : whole08;
+    size_t whole = (R.m_count > 0 && R.m_stride > 0) ? (size_t)R.m_count * (size_t)R.m_stride : 0;
+    size_t bytes = whole;
+    if (gp.expect_vc > 0) { size_t want = (size_t)gp.expect_vc * (size_t)R.m_stride; if (want < bytes) bytes = want; }
+    if (bytes < 64) bytes = (whole >= 64) ? 64 : whole;
     std::vector<uint8_t> buf(bytes);
-    if (!SafeMemcpy(buf.data(), data, bytes)) { Log("gpu-probe: pathA memcpy fault."); return 1; }
+    if (!SafeMemcpy(buf.data(), data, bytes)) { Log("gpu-probe: path M memcpy fault."); return 1; }
 
-    // Stream 0 begins with Position Float32x3 at offset 0.
+    // Stream 0 starts with Position Float32x3 at offset 0 (bind-pose model-space coordinates).
     bool first = true;
-    for (int32_t v = 0; v < take && (size_t)v * (size_t)R.stride + 12 <= bytes; ++v) {
-        const float* fp = reinterpret_cast<const float*>(buf.data() + (size_t)v * R.stride);
+    for (int32_t v = 0; v < take && (size_t)v * (size_t)R.m_stride + 12 <= bytes; ++v) {
+        const float* fp = reinterpret_cast<const float*>(buf.data() + (size_t)v * R.m_stride);
         BE_Vec3 p{ fp[0], fp[1], fp[2] };
-        if (std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z)) {
-            ++R.n_finite;
-            if (first) { R.mn = R.mx = p; first = false; }
+        if (std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z) &&
+            std::abs(p.x) < 1.0e6f && std::abs(p.y) < 1.0e6f && std::abs(p.z) < 1.0e6f) {
+            ++R.m_finite;
+            if (first) { R.mmn = R.mmx = p; first = false; }
             else {
-                if (p.x < R.mn.x) R.mn.x = p.x; if (p.y < R.mn.y) R.mn.y = p.y; if (p.z < R.mn.z) R.mn.z = p.z;
-                if (p.x > R.mx.x) R.mx.x = p.x; if (p.y > R.mx.y) R.mx.y = p.y; if (p.z > R.mx.z) R.mx.z = p.z;
+                if (p.x < R.mmn.x) R.mmn.x = p.x; if (p.y < R.mmn.y) R.mmn.y = p.y; if (p.z < R.mmn.z) R.mmn.z = p.z;
+                if (p.x > R.mmx.x) R.mmx.x = p.x; if (p.y > R.mmx.y) R.mmx.y = p.y; if (p.z > R.mmx.z) R.mmx.z = p.z;
             }
         }
     }
-    // v0.7.9: physical layout is not pinned down yet, so "ok" = readback succeeded with finite coords
-    // (not strict equality with take; the Position offset/format is decoded offline from the RAW probe).
-    R.ok = (R.n_finite > 0);
-    // v0.7.9 RAW probe: dual hex+float view of the first bytes AND a per-vertex float view, so the
-    // exact physical layout (Float16 vs Float32, Position offset, real stride) can be decoded offline.
+    R.ok = (R.m_finite > 0);
     if (g_raw_dump.empty() && std::strstr(gp.name.c_str(), "face")) {
         char rh[160]; std::snprintf(rh, sizeof(rh),
-            "RAW %s count=%d stride=%d take=%d bytes=%zu\n",
-            gp.name.c_str(), R.count, R.stride, take, bytes);
+            "RAWM %s count=%d stride=%d take=%d bytes=%zu\n", gp.name.c_str(), R.m_count, R.m_stride, take, bytes);
         g_raw_dump = rh;
         int hb = (int)bytes; if (hb > 192) hb = 192;
         g_raw_dump += "-- first bytes (offset | hex16 | float32 x4) --\n";
@@ -862,35 +899,27 @@ int CollectOnePart(GpuPart& gp) {
                 p += std::snprintf(row + p, sizeof(row) - p, " %.5g", fv);
             }
             p += std::snprintf(row + p, sizeof(row) - p, "\n");
-            if (p < 0 || p > (int)sizeof(row) - 1) p = sizeof(row) - 1;
+            if (p < 0 || p > (int)sizeof(row) - 1) p = (int)sizeof(row) - 1;
             g_raw_dump += row;
         }
-        g_raw_dump += "-- per-vertex floats (reported stride) --\n";
-        int nf = R.stride / 4; if (nf > 12) nf = 12; if (nf < 1) nf = 10;
-        for (int32_t v = 0; v < take && v < 3 && (size_t)v * (size_t)R.stride + (size_t)nf * 4 <= bytes; ++v) {
-            const float* ff = reinterpret_cast<const float*>(buf.data() + (size_t)v * R.stride);
-            std::string row = "  v" + std::to_string(v) + ":";
-            for (int k = 0; k < nf; ++k) { char fb[40]; std::snprintf(fb, sizeof(fb), " %+.5g", ff[k]); row += fb; }
-            row += "\n"; g_raw_dump += row;
-        }
     }
-    // v0.8.0 per-part compact RAW96 hex -> decode the real interleaved per-vertex stride offline.
     {
-        int hb08 = (int)bytes; if (hb08 > 96) hb08 = 96;
-        char rh08[96]; std::snprintf(rh08, sizeof(rh08), "RAW96 %s ac=%d ast=%d bytes=%zu", gp.name.c_str(), R.a_count, R.a_stride, bytes);
-        R.raw = rh08;
-        for (int off = 0; off < hb08; off += 16) {
+        int hb09 = (int)bytes; if (hb09 > 96) hb09 = 96;
+        char rh09[96]; std::snprintf(rh09, sizeof(rh09), "RAWM96 %s mc=%d mst=%d bytes=%zu", gp.name.c_str(), R.m_count, R.m_stride, bytes);
+        R.mraw = rh09;
+        for (int off = 0; off < hb09; off += 16) {
             char row[96]; int p = std::snprintf(row, sizeof(row), "  %04x:", off);
-            for (int j = 0; j < 16 && off + j < hb08; ++j) p += std::snprintf(row + p, sizeof(row) - p, " %02x", buf[off + j]);
+            for (int j = 0; j < 16 && off + j < hb09; ++j) p += std::snprintf(row + p, sizeof(row) - p, " %02x", buf[off + j]);
             p += std::snprintf(row + p, sizeof(row) - p, "\n");
             if (p > (int)sizeof(row) - 1) p = (int)sizeof(row) - 1;
-            R.raw += row;
+            R.mraw += row;
         }
     }
-    char ob[360]; std::snprintf(ob, sizeof(ob),
-        "gpu-probe[%s] pathA OK finite=%d/%d AABB %.3f %.3f %.3f ~ %.3f %.3f %.3f size %.3f %.3f %.3f",
-        gp.name.c_str(), R.n_finite, take, R.mn.x, R.mn.y, R.mn.z, R.mx.x, R.mx.y, R.mx.z,
-        R.mx.x - R.mn.x, R.mx.y - R.mn.y, R.mx.z - R.mn.z); Log(ob);
+    { MethodContract* relnow = Contract("gb.release");
+      if (relnow && relnow->resolved && gp.m_stage) Invoke(relnow, gp.m_stage, nullptr); }
+    char ob[380]; std::snprintf(ob, sizeof(ob),
+        "gpu-probe[%s] pathM OK finite=%d/%d bindAABB %.3f %.3f %.3f ~ %.3f %.3f %.3f (control A got=%d)",
+        gp.name.c_str(), R.m_finite, take, R.mmn.x, R.mmn.y, R.mmn.z, R.mmx.x, R.mmx.y, R.mmx.z, (int)R.a_got); Log(ob);
     return 1;
 }
 
@@ -907,30 +936,32 @@ void WriteGpuProbeFile(DWORD elapsed_ms) {
     FILE* file = nullptr;
     if (_wfopen_s(&file, path, L"w, ccs=UTF-8") != 0 || !file) { Log("gpu-probe: open output fail."); return; }
     int okcnt = 0; for (auto& gp : g_gpu_parts) if (gp.pr.ok) ++okcnt;
-    fwprintf(file, L"Chen current-frame vertex readback v0.8.0 (set vertexBufferTarget=5 once, wait 12 frames, SMR.GetVertexBuffer + AsyncGPUReadback, restore=1)  %lu ms\n",
+    fwprintf(file, L"Chen bind-pose STATIC vertex readback v0.9.0 (Mesh.GetVertexBuffer(0) static buffer -> Graphics.CopyBuffer into CopySource|CopyDestination staging -> AsyncGPUReadback; SMR current-frame is control only; no game target mutated)  %lu ms\n",
         (unsigned long)elapsed_ms);
     fwprintf(file, L"DEVICE type=%d name='%ls' supportsAsyncGPUReadback method=%d prop=%d  (type 21=Vulkan 6=D3D11 12=D3D12)\n",
         g_dev_type, Utf8ToWide(g_dev_name).c_str(), (int)g_sup_method, (int)g_sup_prop);
-    fwprintf(file, L"parts: %d, pathA readback ok: %d\n\n", (int)g_gpu_parts.size(), okcnt);
-    fwprintf(file, L"%-30ls %7s %5s %8s %7s %6s %8s %5s\n",
-        L"part", L"expect", L"vis", L"Acount", L"Astrd", L"Atgt", L"finite", L"ok");
+    fwprintf(file, L"parts: %d, pathM(static bind-pose) readback ok: %d\n\n", (int)g_gpu_parts.size(), okcnt);
+    fwprintf(file, L"%-28ls %6s %4s %7s %6s %8s %6s %5s\n",
+        L"part", L"expect", L"vis", L"Mcnt", L"Mstd", L"Mfinite", L"Actrl", L"ok");
     for (auto& gp : g_gpu_parts) {
         const GpuPartResult& R = gp.pr; const std::wstring wn = Utf8ToWide(R.name);
-        fwprintf(file, L"%-30ls %7d %5d %8d %7d %6d %8d %5s\n", wn.c_str(),
-            R.expect_vc, R.vis, R.a_count, R.a_stride, R.a_target, R.n_finite, R.ok ? L"TRUE" : L"false");
-        fwprintf(file, L"    pathA(SMR current-frame): got=%d c=%d st=%d target=%d gotBuf=%d reqErr=%d\n",
-            (int)R.a_got, R.a_count, R.a_stride, R.a_target, (int)R.got_buffer, (int)R.req_error);
+        fwprintf(file, L"%-28ls %6d %4d %7d %6d %8d %6d %5s\n", wn.c_str(),
+            R.expect_vc, R.vis, R.m_count, R.m_stride, R.m_finite, (int)R.a_got, R.ok ? L"TRUE" : L"false");
+        fwprintf(file, L"    pathM(static mesh): readable=%d srcGot=%d c=%d st=%d tg=%d stage=%d copy=%d reqErr=%d\n",
+            R.m_readable, (int)R.m_src_got, R.m_count, R.m_stride, R.m_target, (int)R.m_stage_built, (int)R.m_copy_ok, (int)R.m_req_haserr);
+        fwprintf(file, L"    control pathA(SMR current-frame): got=%d c=%d st=%d tg=%d\n",
+            (int)R.a_got, R.a_count, R.a_stride, R.a_target);
         fwprintf(file, L"    layout: %ls\n", Utf8ToWide(R.layout).c_str());
-        fwprintf(file, L"    AABB(reported-stride cross-check) min %.5f %.5f %.5f  max %.5f %.5f %.5f  size %.5f %.5f %.5f\n",
-            R.mn.x, R.mn.y, R.mn.z, R.mx.x, R.mx.y, R.mx.z,
-            R.mx.x - R.mn.x, R.mx.y - R.mn.y, R.mx.z - R.mn.z);
-        if (!R.raw.empty()) fwprintf(file, L"    %ls\n", Utf8ToWide(R.raw).c_str());
+        fwprintf(file, L"    bindPose Position AABB min %.5f %.5f %.5f  max %.5f %.5f %.5f  size %.5f %.5f %.5f\n",
+            R.mmn.x, R.mmn.y, R.mmn.z, R.mmx.x, R.mmx.y, R.mmx.z,
+            R.mmx.x - R.mmn.x, R.mmx.y - R.mmn.y, R.mmx.z - R.mmn.z);
+        if (!R.mraw.empty()) fwprintf(file, L"    %ls\n", Utf8ToWide(R.mraw).c_str());
         fwprintf(file, L"\n");
     }
     if (!g_raw_dump.empty()) fwprintf(file, L"\n%ls", Utf8ToWide(g_raw_dump).c_str());
     fclose(file);
     char m[200]; std::snprintf(m, sizeof(m),
-        "gpu-probe file written: %d/%d parts pathA read back.", okcnt, (int)g_gpu_parts.size()); Log(m);
+        "gpu-probe file written: %d/%d parts pathM(static bind-pose) read back.", okcnt, (int)g_gpu_parts.size()); Log(m);
 }
 
 // Driven every frame by DetourPump. Wait >=3 frames for re-skinning, collect
@@ -938,7 +969,7 @@ void WriteGpuProbeFile(DWORD elapsed_ms) {
 void TickGpuVertexReadback() {
     if (g_gpu_phase.load(std::memory_order_acquire) != 1) return;
     ++g_gpu_wait;
-    if (g_gpu_wait < 12) return; // v0.8.0: wait >=12 frames for the engine to rebuild+skin into the CopySource buffer (3-5 frames tore parts in v0.7.4~7.8)
+    if (g_gpu_wait < 3) return; // v0.9.0: static bind-pose buffer already exists; only let AsyncGPUReadback cross a few frames (no rebuild wait)
     for (auto& gp : g_gpu_parts) {
         if (gp.collected) continue;
         // v0.7.8: throttle parts whose lod0 buffer is absent, to avoid thousands of SEH probes/frame
@@ -953,14 +984,16 @@ void TickGpuVertexReadback() {
         Log("gpu-probe: wait budget exhausted, finalize with whatever is ready.");
     }
     WriteGpuProbeFile(GetTickCount() - g_gpu_start_tick);
-    // v0.8.0: restore the default Vertex(1) usage flag while renderers are still pinned/valid.
-    { MethodContract* sv08 = Contract("skinned.set_vbt");
-      for (auto& gp : g_gpu_parts) if (sv08 && sv08->resolved && gp.renderer) { int32_t usage = 1; void* tp[1]{ &usage }; Invoke(sv08, gp.renderer, tp); } }
+    // v0.9.0: never set any game target, so nothing to restore; release our staging GraphicsBuffer.
+    { MethodContract* rel09 = Contract("gb.release");
+      for (auto& gp : g_gpu_parts) if (rel09 && rel09->resolved && gp.m_stage) Invoke(rel09, gp.m_stage, nullptr); }
     for (auto& gp : g_gpu_parts) {
         if (gp.renderer_root) g_host->gchandle_free(g_host->context, gp.renderer_root);
         if (gp.mesh_root) g_host->gchandle_free(g_host->context, gp.mesh_root);
         if (gp.b0gb_root) g_host->gchandle_free(g_host->context, gp.b0gb_root);
         if (gp.req_root) g_host->gchandle_free(g_host->context, gp.req_root);
+        if (gp.msrc_root) g_host->gchandle_free(g_host->context, gp.msrc_root);
+        if (gp.mstage_root) g_host->gchandle_free(g_host->context, gp.mstage_root);
     }
     g_gpu_parts.clear();
     g_gpu_phase.store(0, std::memory_order_release);
@@ -1036,7 +1069,11 @@ bool ResolveContracts() {
                        Contract("skinned.bake_mesh")->resolved &&
                        Contract("renderer.is_visible")->resolved &&
                        Contract("skinned.get_vb")->resolved &&
-                       Contract("skinned.set_vbt")->resolved &&
+                       Contract("mesh.get_vb_stream")->resolved &&
+                       Contract("gb.ctor")->resolved &&
+                       Contract("gb.release")->resolved &&
+                       Contract("graphics.copy_buffer")->resolved &&
+                       Contract("gb.get_target")->resolved &&
                        Contract("gb.get_count")->resolved &&
                        Contract("gb.get_stride")->resolved &&
                        Contract("mesh.attr_count")->resolved &&
@@ -1104,6 +1141,16 @@ BE_Result BE_CALL Initialize(const BE_HostApiV1* host) {
         Log("Could not resolve UnityEngine.Mesh.MeshDataArray nested class (MeshData direct channel disabled).");
     }
 
+    // v0.9.0: resolve UnityEngine.GraphicsBuffer (object_new a staging buffer for GPU CopyBuffer relay).
+    BE_ResolvedClassV1 gb_class{};
+    if (host->resolve_class(host->context, "UnityEngine.CoreModule.dll",
+            "UnityEngine", "GraphicsBuffer", &gb_class) == BE_Result_Ok && gb_class.class_info) {
+        g_gb_class_info = const_cast<void*>(gb_class.class_info);
+        Log("Resolved support class: UnityEngine.GraphicsBuffer");
+    } else {
+        Log("Could not resolve UnityEngine.GraphicsBuffer class (staging relay disabled).");
+    }
+
     MethodContract* pump = Contract("pump");
     if (!pump || !pump->resolved) {
         Log("Main-thread pump contract missing; exporter cannot run.");
@@ -1118,7 +1165,7 @@ BE_Result BE_CALL Initialize(const BE_HostApiV1* host) {
 
     g_input_stop.store(false, std::memory_order_release);
     g_input_thread = std::thread(InputThreadMain);
-    Log("Scene Exporter v0.8.0 ready (set vertexBufferTarget=Vertex|CopySource once, wait 12 frames, read current-frame SMR buffer, restore). Focus game, stand Chen at MID range full body, press Ctrl+E.");
+    Log("Scene Exporter v0.9.0 ready (READ-ONLY: Mesh static bind-pose buffer -> Graphics.CopyBuffer staging -> AsyncGPUReadback; SMR current-frame is control only; no target mutation). Focus game, stand Chen at MID range full body, press Ctrl+E.");
     return BE_Result_Ok;
 }
 
@@ -1156,7 +1203,7 @@ void BE_CALL Shutdown() {
 }
 
 const BE_ModuleApiV1 kApi{
-    {kModuleId, "Scene Exporter", "0.8.0", BETTER_ENDFIELD_MODULE_ABI_V1},
+    {kModuleId, "Scene Exporter", "0.9.0", BETTER_ENDFIELD_MODULE_ABI_V1},
     &Initialize, &ConfigurationChanged, &Shutdown};
 
 } // namespace
