@@ -1,4 +1,4 @@
-// BetterEndfield Scene Exporter — v0.9.0 (read-only bind-pose static mesh vertex readback: Mesh.GetVertexBuffer(0) -> Graphics.CopyBuffer into our CopySource|CopyDestination staging GraphicsBuffer -> AsyncGPUReadback; no game buffer target is mutated; see TickGpuVertexReadback):
+// BetterEndfield Scene Exporter — v0.9.1 (read-only bind-pose static mesh vertex readback: Mesh.GetVertexBuffer(0) -> Graphics.CopyBuffer into our CopySource|CopyDestination staging GraphicsBuffer -> AsyncGPUReadback; no game buffer target is mutated; see TickGpuVertexReadback):
 // *** NEVER call set_vertexBufferTarget on game meshes/renderers *** — v0.7.4~v0.7.8 did, and it
 // tore down+rebuilt GPU-resident vertex buffers with no CPU copy, so hair/body/clothes vanished
 // on screen right after Ctrl+E (only CPU-backed face/eyebrow/cloth_03 survived). Confirmed by user:
@@ -743,7 +743,7 @@ void StartGpuVertexReadback() {
     g_gpu_wait = 0; g_gpu_start_tick = GetTickCount();
     g_gpu_phase.store(1, std::memory_order_release);
     char m[220]; std::snprintf(m, sizeof(m),
-        "gpu-probe START v0.9.0: %d Chen lod0 parts; READ-ONLY path M = Mesh.GetVertexBuffer(0) static bind-pose buffer -> Graphics.CopyBuffer into our staging -> AsyncGPUReadback; path A (SMR current-frame) recorded as control only.",
+        "gpu-probe START v0.9.1: %d Chen lod0 parts; READ-ONLY path M = Mesh.GetVertexBuffer(0) static bind-pose buffer -> Graphics.CopyBuffer into our staging -> AsyncGPUReadback; path A (SMR current-frame) recorded as control only.",
         (int)g_gpu_parts.size()); Log(m);
 }
 
@@ -936,7 +936,7 @@ void WriteGpuProbeFile(DWORD elapsed_ms) {
     FILE* file = nullptr;
     if (_wfopen_s(&file, path, L"w, ccs=UTF-8") != 0 || !file) { Log("gpu-probe: open output fail."); return; }
     int okcnt = 0; for (auto& gp : g_gpu_parts) if (gp.pr.ok) ++okcnt;
-    fwprintf(file, L"Chen bind-pose STATIC vertex readback v0.9.0 (Mesh.GetVertexBuffer(0) static buffer -> Graphics.CopyBuffer into CopySource|CopyDestination staging -> AsyncGPUReadback; SMR current-frame is control only; no game target mutated)  %lu ms\n",
+    fwprintf(file, L"Chen bind-pose STATIC vertex readback v0.9.1 (Mesh.GetVertexBuffer(0) static buffer -> Graphics.CopyBuffer into CopySource|CopyDestination staging -> AsyncGPUReadback; SMR current-frame is control only; no game target mutated)  %lu ms\n",
         (unsigned long)elapsed_ms);
     fwprintf(file, L"DEVICE type=%d name='%ls' supportsAsyncGPUReadback method=%d prop=%d  (type 21=Vulkan 6=D3D11 12=D3D12)\n",
         g_dev_type, Utf8ToWide(g_dev_name).c_str(), (int)g_sup_method, (int)g_sup_prop);
@@ -1073,7 +1073,6 @@ bool ResolveContracts() {
                        Contract("gb.ctor")->resolved &&
                        Contract("gb.release")->resolved &&
                        Contract("graphics.copy_buffer")->resolved &&
-                       Contract("gb.get_target")->resolved &&
                        Contract("gb.get_count")->resolved &&
                        Contract("gb.get_stride")->resolved &&
                        Contract("mesh.attr_count")->resolved &&
@@ -1165,7 +1164,7 @@ BE_Result BE_CALL Initialize(const BE_HostApiV1* host) {
 
     g_input_stop.store(false, std::memory_order_release);
     g_input_thread = std::thread(InputThreadMain);
-    Log("Scene Exporter v0.9.0 ready (READ-ONLY: Mesh static bind-pose buffer -> Graphics.CopyBuffer staging -> AsyncGPUReadback; SMR current-frame is control only; no target mutation). Focus game, stand Chen at MID range full body, press Ctrl+E.");
+    Log("Scene Exporter v0.9.1 ready (READ-ONLY: Mesh static bind-pose buffer -> Graphics.CopyBuffer staging -> AsyncGPUReadback; SMR current-frame is control only; no target mutation). Focus game, stand Chen at MID range full body, press Ctrl+E.");
     return BE_Result_Ok;
 }
 
@@ -1203,7 +1202,7 @@ void BE_CALL Shutdown() {
 }
 
 const BE_ModuleApiV1 kApi{
-    {kModuleId, "Scene Exporter", "0.9.0", BETTER_ENDFIELD_MODULE_ABI_V1},
+    {kModuleId, "Scene Exporter", "0.9.1", BETTER_ENDFIELD_MODULE_ABI_V1},
     &Initialize, &ConfigurationChanged, &Shutdown};
 
 } // namespace
